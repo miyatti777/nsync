@@ -45,6 +45,7 @@ class Config:
         self.max_retries = 3
         self.retry_backoff = 2.0
         self.exclude_paths = ["_sync", "_archived"]
+        self.db_page_content = False
 
 CFG = Config()
 
@@ -87,6 +88,7 @@ def load_config(config_path):
     CFG.max_retries = data.get("max_retries", 3)
     CFG.retry_backoff = data.get("retry_backoff", 2.0)
     CFG.exclude_paths = data.get("exclude_paths", ["_sync", "_archived"])
+    CFG.db_page_content = data.get("db_page_content", False)
 
 
 def _parse_simple_yaml(text):
@@ -691,6 +693,20 @@ def fetch_database_to_sqlite(db_id, db_title, db_path):
     if not all_rows:
         return 0
 
+    if CFG.db_page_content:
+        total = len(all_rows)
+        print("    Fetching page body for %d rows..." % total, flush=True)
+        for idx, row in enumerate(all_rows):
+            pid = row.get("_notion_page_id", "")
+            if pid:
+                try:
+                    row["_body"] = fetch_page_blocks_as_text(pid)
+                except Exception:
+                    row["_body"] = ""
+                time.sleep(CFG.rate_limit_delay)
+            if (idx + 1) % 20 == 0:
+                print("    ... body %d/%d" % (idx + 1, total), flush=True)
+
     columns = sorted(all_props)
     sqlite_path = db_filepath(db_title, db_path)
 
@@ -704,6 +720,8 @@ def fetch_database_to_sqlite(db_id, db_title, db_path):
         col_defs.append("[%s] TEXT" % col)
     col_defs.append("_created_time TEXT")
     col_defs.append("_last_edited_time TEXT")
+    if CFG.db_page_content:
+        col_defs.append("_body TEXT")
 
     c.execute("CREATE TABLE data (%s)" % ", ".join(col_defs))
 
@@ -714,6 +732,8 @@ def fetch_database_to_sqlite(db_id, db_title, db_path):
             vals.append(row.get(col, ""))
         vals.append(row.get("_created_time", ""))
         vals.append(row.get("_last_edited_time", ""))
+        if CFG.db_page_content:
+            vals.append(row.get("_body", ""))
         placeholders = ", ".join(["?"] * len(vals))
         c.execute("INSERT INTO data VALUES (%s)" % placeholders, vals)
 

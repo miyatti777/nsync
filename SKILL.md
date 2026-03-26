@@ -174,6 +174,7 @@ exclude_paths:
 | `label` | 表示用ラベル | Notionタイトル or ディレクトリ名 |
 | `crawl_max_depth` | クロールの最大深度 | `10` |
 | `rate_limit_delay` | API呼び出し間の待機秒数 | `0.35` |
+| `db_page_content` | DB各行のページ本文を `_body` カラムに格納 | `false` |
 | `exclude_paths` | rglob検索から除外するパス文字列 | `["_sync", "_archived"]` |
 
 ## Data Model
@@ -186,6 +187,13 @@ YAML front matter付きで保存。本文が空のコンテナページも正常
 
 各Notion DBは個別の `.db` ファイルとして、Notionの階層に合わせた位置に配置。
 各DBには `data` テーブル（全レコード）と `_metadata` テーブル（同期情報）が含まれる。
+
+`db_page_content: true` を設定すると、各行のページ本文（Notion上でレコードを開いた時のコンテンツ）を
+Markdownに変換して `_body` カラムに格納する。SQL で本文も含めて検索可能。
+
+```sql
+SELECT Name, _body FROM data WHERE _body LIKE '%キーワード%'
+```
 
 ## Typical Workflows
 

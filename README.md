@@ -149,6 +149,7 @@ exclude_paths:
 | `label` | 表示用ラベル | Notionタイトル or ディレクトリ名 |
 | `crawl_max_depth` | クロールの最大深度 | `10` |
 | `rate_limit_delay` | API呼び出し間の待機秒数 | `0.35` |
+| `db_page_content` | DB各行のページ本文を `_body` カラムに格納 | `false` |
 | `exclude_paths` | 検索から除外するパス | `["_sync", "_archived"]` |
 
 ## 対応ブロックタイプ
@@ -183,6 +184,21 @@ exclude_paths:
 インライン装飾（太字/イタリック/取り消し線/コード/リンク）対応。
 
 `push` は `child_page` / `child_database` ブロックを保護します（削除しない）。
+
+### DB 行のページ本文
+
+`.nsync.yaml` に `db_page_content: true` を設定すると、データベース各行のページ本文（Notion上でレコードを開いた時に表示されるコンテンツ）を Markdown に変換し、SQLite の `_body` カラムに格納します。
+
+```yaml
+db_page_content: true
+```
+
+```sql
+-- 本文にキーワードを含むレコードを検索
+SELECT Name, substr(_body, 1, 200) FROM data WHERE _body LIKE '%Sprint%'
+```
+
+デフォルトは `false`（プロパティのみ）。大量レコードの DB では API コール数が増加するため、必要な場合のみ有効化してください。
 
 ### Pull (単一ページ取得)
 
