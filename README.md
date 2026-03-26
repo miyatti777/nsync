@@ -96,6 +96,7 @@ cd projects/my-project
 | `init <url> [dir]` | Yes | 新規ワークスペース作成 |
 | `crawl` | Yes | Notion側のツリーを再クロール |
 | `sync` | Yes | 差分同期（デフォルト） |
+| `sync --dry-run` | Yes | 変更検出のみ（ダウンロードしない） |
 | `sync --force` | Yes | 全ページ強制再ダウンロード |
 | `full` | Yes | `crawl` + `sync --force` |
 | `pull <file.md>` | Yes | 特定ページをNotionから再取得 |

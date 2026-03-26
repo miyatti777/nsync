@@ -1123,7 +1123,7 @@ def cmd_crawl():
     return items
 
 
-def cmd_sync(force=False):
+def cmd_sync(force=False, dry_run=False):
     if not CFG.tree_json.exists():
         print("No tree cache found. Running crawl first...", flush=True)
         tree = cmd_crawl()
@@ -1177,8 +1177,19 @@ def cmd_sync(force=False):
     to_download = new_items + updated_items
     if not to_download:
         print("Nothing to sync.", flush=True)
-        state["last_sync"] = now
-        save_sync_state(state)
+        return
+
+    if dry_run:
+        print(flush=True)
+        print("Would download %d items:" % len(to_download), flush=True)
+        for idx, item in enumerate(to_download):
+            label = "NEW" if item in new_items else "UPD"
+            print("  [%d] %s %s %s" % (
+                idx + 1, label,
+                "db" if item["type"] == "db" else "pg",
+                item["title"][:60]
+            ), flush=True)
+        print("\n(dry-run: no files modified)", flush=True)
         return
 
     print(flush=True)
@@ -1572,7 +1583,8 @@ def main():
         cmd_crawl()
     elif command == "sync":
         force = "--force" in args
-        cmd_sync(force=force)
+        dry_run = "--dry-run" in args
+        cmd_sync(force=force, dry_run=dry_run)
     elif command == "init-state":
         cmd_init_state()
     elif command == "status":
@@ -1616,6 +1628,7 @@ def print_usage():
     print("Commands:", flush=True)
     print("  crawl              Re-crawl Notion tree", flush=True)
     print("  sync               Differential sync (default)", flush=True)
+    print("  sync --dry-run     Show what would be synced", flush=True)
     print("  sync --force       Force re-download all", flush=True)
     print("  init-state         Init state from existing files", flush=True)
     print("  status             Show sync status", flush=True)
