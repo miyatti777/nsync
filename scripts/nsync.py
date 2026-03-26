@@ -10,9 +10,11 @@ nsync — Generic Notion Sync Tool
 
 __version__ = "0.1.0"
 
+import atexit
 import json
 import os
 import re
+import signal
 import sqlite3
 import sys
 import time
@@ -166,6 +168,53 @@ def extract_page_id_from_url(url):
 
 
 # ==========================================
+# Crash Detection & Heartbeat
+# ==========================================
+
+_crawl_state = {"items": None, "queue": None, "active": False}
+
+def _heartbeat_path():
+    return Path(CFG.base_output_dir) / "_sync" / "heartbeat"
+
+def _write_heartbeat():
+    """Write current timestamp to heartbeat file for external monitoring."""
+    try:
+        hb = _heartbeat_path()
+        hb.parent.mkdir(parents=True, exist_ok=True)
+        hb.write_text(datetime.now().isoformat() + "\n")
+    except Exception:
+        pass
+
+def _remove_heartbeat():
+    try:
+        _heartbeat_path().unlink(missing_ok=True)
+    except Exception:
+        pass
+
+def _emergency_save():
+    """Save checkpoint on crash/signal if crawl is active."""
+    if _crawl_state["active"] and _crawl_state["items"] is not None:
+        try:
+            _save_checkpoint(_crawl_state["items"], _crawl_state["queue"] or [])
+            print("\n  [emergency checkpoint saved on exit: %d items]" %
+                  len(_crawl_state["items"]), flush=True)
+        except Exception:
+            pass
+    _remove_heartbeat()
+    _print_api_stats()
+
+def _signal_handler(signum, frame):
+    sig_name = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
+    print("\n  Received %s — saving state..." % sig_name, flush=True)
+    _emergency_save()
+    sys.exit(128 + signum)
+
+signal.signal(signal.SIGTERM, _signal_handler)
+signal.signal(signal.SIGINT, _signal_handler)
+atexit.register(_emergency_save)
+
+
+# ==========================================
 # Notion API
 # ==========================================
 
@@ -312,11 +361,20 @@ def deep_crawl(block_id, path="", depth=0, resume_items=None, resume_queue=None)
 
     count = len(items)
     last_checkpoint = count
+    processed = 0
+    initial_queue = len(queue)
+    last_checkpoint_time = time.time()
+
+    _crawl_state["items"] = items
+    _crawl_state["queue"] = queue
+    _crawl_state["active"] = True
 
     try:
         while queue:
             current_id, current_path, current_depth = queue.pop(0)
+            processed += 1
 
+            _write_heartbeat()
             blocks = get_blocks(current_id)
             for b in blocks:
                 t = b["type"]
@@ -357,6 +415,16 @@ def deep_crawl(block_id, path="", depth=0, resume_items=None, resume_queue=None)
                     last_checkpoint = count
                     print("  [checkpoint saved: %d items, %d remaining in queue]" % (count, len(queue)), flush=True)
 
+            if processed % 50 == 0:
+                print("  [processed %d queue items, found %d total, %d remaining]" % (processed, count, len(queue)), flush=True)
+
+            now_t = time.time()
+            if now_t - last_checkpoint_time >= 60:
+                _save_checkpoint(items, queue)
+                last_checkpoint_time = now_t
+                if processed % 50 != 0:
+                    print("  [time-checkpoint: %d items, %d remaining]" % (count, len(queue)), flush=True)
+
             time.sleep(CFG.rate_limit_delay)
     except RateLimitExhausted as e:
         print("  RATE LIMIT: %s" % e, flush=True)
@@ -365,7 +433,9 @@ def deep_crawl(block_id, path="", depth=0, resume_items=None, resume_queue=None)
         print("  Re-run the same command to resume from checkpoint.", flush=True)
         raise
 
+    _crawl_state["active"] = False
     _remove_checkpoint()
+    _remove_heartbeat()
     return items
 
 
@@ -1584,6 +1654,22 @@ def cmd_status():
     print("Output: %s" % CFG.base_output_dir, flush=True)
     print("Tracked items: %d" % len(items), flush=True)
     print("Last sync: %s" % last_sync, flush=True)
+
+    hb = _heartbeat_path()
+    cp = _load_checkpoint()
+    if hb.exists():
+        hb_time = hb.read_text().strip()
+        age = (datetime.now() - datetime.fromisoformat(hb_time)).total_seconds()
+        if age < 10:
+            print("Crawl: RUNNING (heartbeat %ds ago)" % int(age), flush=True)
+        else:
+            print("Crawl: STALE heartbeat (%ds ago — may have crashed)" % int(age), flush=True)
+        if cp:
+            print("  Checkpoint: %d items, %d queue" % (len(cp["items"]), len(cp["queue"])), flush=True)
+    elif cp:
+        print("Crawl: STOPPED (checkpoint available: %d items, %d queue)" % (
+            len(cp["items"]), len(cp["queue"])), flush=True)
+        print("  Run 'sync' to resume from checkpoint", flush=True)
 
     pages = {k: v for k, v in items.items() if v.get("type") == "page"}
     dbs = {k: v for k, v in items.items() if v.get("type") == "db"}
