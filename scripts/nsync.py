@@ -296,40 +296,104 @@ def get_blocks(block_id):
     return results
 
 
-_crawl_counter = [0]
+CHECKPOINT_INTERVAL = 50
 
-def deep_crawl(block_id, path="", depth=0):
-    items = []
-    blocks = get_blocks(block_id)
-    for b in blocks:
-        t = b["type"]
-        bid = b["id"]
-        hc = b.get("has_children", False)
+def _checkpoint_path():
+    return CFG.sync_dir / "crawl_checkpoint.json"
 
-        if t == "child_page":
-            title = b["child_page"]["title"]
-            full_path = path + "/" + title if path else title
-            _crawl_counter[0] += 1
-            if _crawl_counter[0] % 10 == 0:
-                print("  ... found %d items (depth=%d)" % (_crawl_counter[0], depth), flush=True)
-            items.append({
-                "type": "page", "title": title, "path": full_path,
-                "id": bid, "depth": depth, "has_children": hc
-            })
-            if hc and depth < CFG.crawl_max_depth:
-                time.sleep(CFG.rate_limit_delay)
-                items.extend(deep_crawl(bid, full_path, depth + 1))
-        elif t == "child_database":
-            title = b["child_database"]["title"]
-            full_path = path + "/" + title if path else title
-            _crawl_counter[0] += 1
-            items.append({
-                "type": "db", "title": title, "path": full_path,
-                "id": bid, "depth": depth
-            })
-        elif hc and depth < CFG.crawl_max_depth:
-            time.sleep(CFG.rate_limit_delay)
-            items.extend(deep_crawl(bid, path, depth))
+
+def _save_checkpoint(items, queue):
+    CFG.sync_dir.mkdir(parents=True, exist_ok=True)
+    cp = {
+        "items": items,
+        "queue": queue,
+        "saved_at": datetime.now().isoformat(),
+    }
+    with open(_checkpoint_path(), "w") as f:
+        json.dump(cp, f, ensure_ascii=False)
+
+
+def _load_checkpoint():
+    p = _checkpoint_path()
+    if not p.exists():
+        return None
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _remove_checkpoint():
+    p = _checkpoint_path()
+    if p.exists():
+        p.unlink()
+
+
+def deep_crawl(block_id, path="", depth=0, resume_items=None, resume_queue=None):
+    """BFS crawl with periodic checkpoint saves for resumability."""
+    if resume_items is not None and resume_queue is not None:
+        items = resume_items
+        queue = [q for q in resume_queue if q[2] <= CFG.crawl_max_depth]
+        skipped = len(resume_queue) - len(queue)
+        visited = set(i["id"] for i in items)
+        print("  Resuming from checkpoint: %d items, %d queue" % (len(items), len(queue)), flush=True)
+        if skipped:
+            print("  Skipped %d queue entries exceeding max_depth=%d" % (skipped, CFG.crawl_max_depth), flush=True)
+    else:
+        items = []
+        queue = [(block_id, path, depth)]
+        visited = set()
+
+    count = len(items)
+    last_checkpoint = count
+
+    while queue:
+        current_id, current_path, current_depth = queue.pop(0)
+
+        blocks = get_blocks(current_id)
+        for b in blocks:
+            t = b["type"]
+            bid = b["id"]
+            hc = b.get("has_children", False)
+
+            if t == "child_page":
+                title = b["child_page"]["title"]
+                full_path = current_path + "/" + title if current_path else title
+                if bid not in visited:
+                    visited.add(bid)
+                    count += 1
+                    if count % 10 == 0:
+                        print("  ... found %d items (depth=%d)" % (count, current_depth), flush=True)
+                    items.append({
+                        "type": "page", "title": title, "path": full_path,
+                        "id": bid, "depth": current_depth, "has_children": hc
+                    })
+                    if hc and current_depth < CFG.crawl_max_depth:
+                        queue.append((bid, full_path, current_depth + 1))
+            elif t == "child_database":
+                title = b["child_database"]["title"]
+                full_path = current_path + "/" + title if current_path else title
+                if bid not in visited:
+                    visited.add(bid)
+                    count += 1
+                    items.append({
+                        "type": "db", "title": title, "path": full_path,
+                        "id": bid, "depth": current_depth
+                    })
+            elif hc and current_depth < CFG.crawl_max_depth:
+                if bid not in visited:
+                    visited.add(bid)
+                    queue.append((bid, current_path, current_depth))
+
+            if count - last_checkpoint >= CHECKPOINT_INTERVAL:
+                _save_checkpoint(items, queue)
+                last_checkpoint = count
+                print("  [checkpoint saved: %d items, %d remaining in queue]" % (count, len(queue)), flush=True)
+
+        time.sleep(CFG.rate_limit_delay)
+
+    _remove_checkpoint()
     return items
 
 
@@ -1093,7 +1157,6 @@ def _mark_containers(items):
 
 
 def cmd_crawl():
-    _crawl_counter[0] = 0
     print("=== Crawling %s (root: %s) ===" % (CFG.label, CFG.root_page_id), flush=True)
     print("Started: " + datetime.now().isoformat(), flush=True)
 
@@ -1103,7 +1166,16 @@ def cmd_crawl():
         "path": root_title, "id": CFG.root_page_id,
         "depth": -1, "has_children": True, "is_root": True
     }
-    items = [root_item] + deep_crawl(CFG.root_page_id)
+
+    cp = _load_checkpoint()
+    if cp:
+        print("Found checkpoint (%s): %d items, %d queue" % (
+            cp.get("saved_at", "?"), len(cp["items"]), len(cp["queue"])), flush=True)
+        crawled = deep_crawl(CFG.root_page_id, resume_items=cp["items"], resume_queue=cp["queue"])
+    else:
+        crawled = deep_crawl(CFG.root_page_id)
+
+    items = [root_item] + crawled
     _mark_containers(items)
 
     CFG.sync_dir.mkdir(parents=True, exist_ok=True)

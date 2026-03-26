@@ -217,6 +217,22 @@ export NSYNC_SCRIPT=/path/to/nsync.py
 - Notion API トークン（Internal Integration）
 - PyYAML（オプション、なくても簡易パーサーで動作）
 
+## クロールの再開
+
+大規模なNotionツリー（数百ページ以上）のクロールは時間がかかることがあります。
+nsync はクロール中に50件ごとにチェックポイントを `_sync/crawl_checkpoint.json` に保存します。
+
+プロセスが中断した場合（タイムアウト、ネットワークエラーなど）、次回 `sync` 実行時にチェックポイントから自動的に再開します。
+
+```bash
+# 中断後に再実行 → 自動で途中から再開
+./nsync.sh sync
+# Found checkpoint (2026-03-26T23:46:51): 150 items, 134 queue
+# Resuming from checkpoint: 150 items, 60 queue
+```
+
+`crawl_max_depth` を変更した場合、不要なキュー項目は自動的にスキップされます。
+
 ## ライセンス
 
 MIT License — 詳細は [LICENSE](LICENSE) を参照。
