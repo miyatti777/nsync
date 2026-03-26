@@ -75,6 +75,8 @@ cd <output_dir>
 | `sync` | Yes | 差分同期（デフォルト） |
 | `sync --force` | Yes | 全ページ強制再ダウンロード |
 | `full` | Yes | `crawl` + `sync --force` |
+| `pull <file.md>` | Yes | 特定ページをNotionから再取得 |
+| `pull --dry-run <file.md>` | Yes | Notion側ブロック一覧のプレビュー |
 | `push <file.md>` | Yes | ローカルMDをNotionに反映 |
 | `push --dry-run <file.md>` | No | Push内容のプレビュー（書き込みなし） |
 | `status` | No | 同期状態のサマリー表示 |
@@ -119,6 +121,18 @@ Notion のインライン装飾を正しくMarkdownに変換:
 ### ネストブロック
 
 リスト内のサブリスト・ネストされたコンテンツを再帰的に取得し、インデントで表現（最大3階層）。
+
+## Pull (single page)
+
+特定ページだけをNotionから再取得する。front matter の `notion_id` を使って対象を特定。
+
+```bash
+./nsync.sh pull --dry-run path/to/page.md   # プレビュー
+./nsync.sh pull path/to/page.md              # 実行
+```
+
+`sync` が全ページの差分同期なのに対し、`pull` は指定した1ファイルだけを即座に更新する。
+`push` と対になるコマンド。
 
 ## Push Quality (Markdown → Notion)
 

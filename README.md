@@ -98,6 +98,8 @@ cd projects/my-project
 | `sync` | Yes | 差分同期（デフォルト） |
 | `sync --force` | Yes | 全ページ強制再ダウンロード |
 | `full` | Yes | `crawl` + `sync --force` |
+| `pull <file.md>` | Yes | 特定ページをNotionから再取得 |
+| `pull --dry-run <file.md>` | Yes | Notion側ブロック一覧のプレビュー |
 | `push <file.md>` | Yes | ローカルMDをNotionに反映 |
 | `push --dry-run <file.md>` | No | Push内容のプレビュー |
 | `status` | No | 同期状態のサマリー表示 |
@@ -181,6 +183,18 @@ exclude_paths:
 インライン装飾（太字/イタリック/取り消し線/コード/リンク）対応。
 
 `push` は `child_page` / `child_database` ブロックを保護します（削除しない）。
+
+### Pull (単一ページ取得)
+
+特定ページだけをNotionから再取得:
+
+```bash
+./nsync.sh pull --dry-run path/to/page.md   # プレビュー（Notion側のブロック一覧を表示）
+./nsync.sh pull path/to/page.md              # 実行（ローカルファイルを上書き更新）
+```
+
+`sync` が全ページの差分同期なのに対し、`pull` は指定した1ファイルだけを即座に更新します。
+`push` と対になるコマンドです。
 
 ## nsync.sh の発見ロジック
 

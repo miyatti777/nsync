@@ -919,6 +919,90 @@ def markdown_to_notion_blocks(md_text):
     return blocks
 
 
+def cmd_pull(filepath, dry_run=False):
+    p = Path(filepath)
+    if not p.exists():
+        print("ERROR: File not found: %s" % filepath, flush=True)
+        return False
+
+    text = p.read_text(encoding="utf-8")
+    fm, body = parse_front_matter(text)
+    notion_id = fm.get("notion_id", "")
+    notion_path = fm.get("notion_path", "")
+
+    if not notion_id:
+        print("ERROR: No notion_id in front matter of %s" % filepath, flush=True)
+        return False
+
+    if dry_run:
+        print("=== Pull DRY RUN ===", flush=True)
+        print("File: %s" % filepath, flush=True)
+        print("Notion ID: %s" % notion_id, flush=True)
+        print("Fetching blocks from Notion...", flush=True)
+        print("", flush=True)
+
+        blocks = []
+        cursor = None
+        while True:
+            url = "https://api.notion.com/v1/blocks/%s/children?page_size=100" % notion_id
+            if cursor:
+                url += "&start_cursor=" + cursor
+            data = api_get(url)
+            if not data:
+                break
+            blocks.extend(data.get("results", []))
+            if not data.get("has_more"):
+                break
+            cursor = data.get("next_cursor")
+            time.sleep(CFG.rate_limit_delay)
+
+        print("Blocks on Notion: %d" % len(blocks), flush=True)
+        print("", flush=True)
+        for i, b in enumerate(blocks):
+            bt = b["type"]
+            if bt in ("child_page", "child_database"):
+                title = b.get(bt, {}).get("title", "")
+                print("  [%d] %s: %s" % (i + 1, bt, title), flush=True)
+                continue
+            rt = b.get(bt, {}).get("rich_text", [])
+            preview = "".join(s.get("plain_text", "")[:60] for s in rt[:3])
+            if not preview and bt == "divider":
+                preview = "---"
+            elif not preview and bt == "code":
+                preview = "(code block)"
+            elif not preview and bt == "image":
+                img = b.get(bt, {})
+                if img.get("type") == "file":
+                    preview = img.get("file", {}).get("url", "")[:60]
+                elif img.get("type") == "external":
+                    preview = img.get("external", {}).get("url", "")[:60]
+            print("  [%d] %s: %s" % (i + 1, bt, preview), flush=True)
+
+        print("\n(dry-run: local file not modified)", flush=True)
+        return True
+
+    print("=== Pull from Notion ===", flush=True)
+    print("File: %s" % filepath, flush=True)
+    print("Notion ID: %s" % notion_id, flush=True)
+
+    md = fetch_page_blocks_as_text(notion_id)
+    now = datetime.now().isoformat()
+
+    fm["synced_at"] = now
+    if "pushed_at" in fm:
+        del fm["pushed_at"]
+    fm_lines = ["---"]
+    for k, v in fm.items():
+        fm_lines.append("%s: %s" % (k, v))
+    fm_lines.append("---")
+    p.write_text("\n".join(fm_lines) + "\n\n" + md, encoding="utf-8")
+
+    lines = md.count("\n") + 1 if md else 0
+    print("Downloaded: %d lines" % lines, flush=True)
+    print("Pull complete.", flush=True)
+    return True
+
+
 def cmd_push(filepath, dry_run=False):
     p = Path(filepath)
     if not p.exists():
@@ -1496,6 +1580,13 @@ def main():
     elif command == "full":
         cmd_crawl()
         cmd_sync(force=True)
+    elif command == "pull":
+        dry_run = "--dry-run" in args
+        pull_args = [a for a in args[1:] if a != "--dry-run"]
+        if len(pull_args) < 1:
+            print("Usage: nsync.py pull [--dry-run] <filepath.md>", flush=True)
+            sys.exit(1)
+        cmd_pull(pull_args[0], dry_run=dry_run)
     elif command == "push":
         dry_run = "--dry-run" in args
         push_args = [a for a in args[1:] if a != "--dry-run"]
@@ -1529,6 +1620,7 @@ def print_usage():
     print("  init-state         Init state from existing files", flush=True)
     print("  status             Show sync status", flush=True)
     print("  full               Crawl + force sync all", flush=True)
+    print("  pull <file.md>     Pull single page from Notion", flush=True)
     print("  push <file.md>     Push local MD to Notion", flush=True)
     print("  db-list            List all databases", flush=True)
     print('  query <db> "SQL"   Query a database', flush=True)
