@@ -265,6 +265,21 @@ nsync はクロール中に50件ごとにチェックポイントを `_sync/craw
 
 `crawl_max_depth` を変更した場合、不要なキュー項目は自動的にスキップされます。
 
+## Rate Limit ハンドリング
+
+Notion API のレート制限（429）に対して:
+
+- **Retry-After 対応**: Notion が返す `Retry-After` ヘッダーの秒数で待機（ヘッダーがない場合は指数バックオフ）
+- **安全停止**: 連続して 429 が返り続けた場合、チェックポイントを保存して安全に停止（exit code 2）
+- **自動再開**: 次回実行時にチェックポイントから再開
+- **API 統計**: プロセス終了時に `[API: 500 calls, 3 rate-limited, 1 errors]` のようなサマリーを表示
+
+```bash
+# Rate Limit で停止した場合、再実行するだけで再開
+./nsync.sh sync
+# Found checkpoint: 300 items, 200 queue → 自動再開
+```
+
 ## ライセンス
 
 MIT License — 詳細は [LICENSE](LICENSE) を参照。
