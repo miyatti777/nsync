@@ -58,12 +58,11 @@ python3 <skill_dir>/scripts/nsync.py init <notion-url> [output-dir]
 - `nsync.sh` 生成（共通トークンへのフォールバック付き）
 - `_sync/.env` にトークンをコピー（共通トークンがある場合）
 
-### 2. クロール & 同期
+### 2. 同期
 
 ```bash
 cd <output_dir>
-./nsync.sh crawl    # ツリー構造を取得
-./nsync.sh sync     # 差分同期
+./nsync.sh sync     # 差分同期（初回はツリー取得も自動実行）
 ```
 
 ## Commands
@@ -71,11 +70,11 @@ cd <output_dir>
 | コマンド | API必要 | 説明 |
 |---------|---------|------|
 | `init <url> [dir]` | Yes | 新規ワークスペース作成 |
-| `crawl` | Yes | Notion側のツリーを再クロール |
-| `sync` | Yes | 差分同期（デフォルト） |
-| `sync --dry-run` | Yes | 変更検出のみ（ダウンロードしない） |
+| `sync` | Yes | 差分同期（デフォルト、初回はツリー取得も自動） |
+| `sync --refresh` | Yes | ページ一覧を最新化してから差分同期 |
 | `sync --force` | Yes | 全ページ強制再ダウンロード |
-| `full` | Yes | `crawl` + `sync --force` |
+| `sync --full` | Yes | `--refresh` + `--force`（完全再同期） |
+| `sync --dry-run` | Yes | 変更検出のみ（ダウンロードしない） |
 | `pull <file.md>` | Yes | 特定ページをNotionから再取得 |
 | `pull --dry-run <file.md>` | Yes | Notion側ブロック一覧のプレビュー |
 | `push <file.md>` | Yes | ローカルMDをNotionに反映 |
@@ -203,7 +202,7 @@ YAML front matter付きで保存。本文が空のコンテナページも正常
 
 ### 全データ再取得
 ```bash
-./nsync.sh full
+./nsync.sh sync --full
 ```
 
 ## Notes

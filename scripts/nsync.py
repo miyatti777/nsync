@@ -1123,9 +1123,10 @@ def cmd_crawl():
     return items
 
 
-def cmd_sync(force=False, dry_run=False):
-    if not CFG.tree_json.exists():
-        print("No tree cache found. Running crawl first...", flush=True)
+def cmd_sync(force=False, dry_run=False, refresh=False):
+    if refresh or not CFG.tree_json.exists():
+        if not CFG.tree_json.exists():
+            print("No tree cache found. Running refresh...", flush=True)
         tree = cmd_crawl()
     else:
         with open(CFG.tree_json) as f:
@@ -1523,8 +1524,7 @@ python3 "$NSYNC" --config "$DIR/.nsync.yaml" "${@:-sync}"
     print("\nNext steps:", flush=True)
     print("  1. Edit %s and set NOTION_API_TOKEN" % env_path, flush=True)
     print("  2. cd %s" % out, flush=True)
-    print("  3. ./nsync.sh crawl", flush=True)
-    print("  4. ./nsync.sh sync", flush=True)
+    print("  3. ./nsync.sh sync", flush=True)
 
 
 # ==========================================
@@ -1584,14 +1584,18 @@ def main():
     elif command == "sync":
         force = "--force" in args
         dry_run = "--dry-run" in args
-        cmd_sync(force=force, dry_run=dry_run)
+        refresh = "--refresh" in args
+        full = "--full" in args
+        if full:
+            refresh = True
+            force = True
+        cmd_sync(force=force, dry_run=dry_run, refresh=refresh)
     elif command == "init-state":
         cmd_init_state()
     elif command == "status":
         cmd_status()
     elif command == "full":
-        cmd_crawl()
-        cmd_sync(force=True)
+        cmd_sync(force=True, refresh=True)
     elif command == "pull":
         dry_run = "--dry-run" in args
         pull_args = [a for a in args[1:] if a != "--dry-run"]
@@ -1626,15 +1630,15 @@ def print_usage():
     print("  nsync.py --config <.nsync.yaml> <command>  Run with config", flush=True)
     print("", flush=True)
     print("Commands:", flush=True)
-    print("  crawl              Re-crawl Notion tree", flush=True)
     print("  sync               Differential sync (default)", flush=True)
+    print("  sync --refresh     Refresh page list, then sync", flush=True)
+    print("  sync --force       Force re-download all pages", flush=True)
+    print("  sync --full         Refresh + force (complete re-sync)", flush=True)
     print("  sync --dry-run     Show what would be synced", flush=True)
-    print("  sync --force       Force re-download all", flush=True)
-    print("  init-state         Init state from existing files", flush=True)
-    print("  status             Show sync status", flush=True)
-    print("  full               Crawl + force sync all", flush=True)
     print("  pull <file.md>     Pull single page from Notion", flush=True)
     print("  push <file.md>     Push local MD to Notion", flush=True)
+    print("  status             Show sync status", flush=True)
+    print("  init-state         Init state from existing files", flush=True)
     print("  db-list            List all databases", flush=True)
     print('  query <db> "SQL"   Query a database', flush=True)
 
