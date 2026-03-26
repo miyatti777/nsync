@@ -20,21 +20,21 @@
 
 ```bash
 mkdir -p .claude/skills
-git clone https://github.com/your-org/nsync.git .claude/skills/nsync
+git clone https://github.com/miyatti777/nsync.git .claude/skills/nsync
 ```
 
 または `$HOME/.claude/skills/` にグローバルインストール:
 
 ```bash
 mkdir -p ~/.claude/skills
-git clone https://github.com/your-org/nsync.git ~/.claude/skills/nsync
+git clone https://github.com/miyatti777/nsync.git ~/.claude/skills/nsync
 ```
 
 ### スタンドアロンで使う場合
 
 ```bash
 # スクリプトを直接ダウンロード
-curl -o nsync.py https://raw.githubusercontent.com/your-org/nsync/main/scripts/nsync.py
+curl -o nsync.py https://raw.githubusercontent.com/miyatti777/nsync/main/scripts/nsync.py
 chmod +x nsync.py
 ```
 
