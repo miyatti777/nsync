@@ -184,7 +184,7 @@ exclude_paths:
 | `label` | 表示用ラベル | Notionタイトル or ディレクトリ名 |
 | `crawl_max_depth` | クロールの最大深度 | `10` |
 | `rate_limit_delay` | API呼び出し間の待機秒数 | `0.35` |
-| `db_page_content` | DB各行のページ本文を `_body` カラムに格納 | `false` |
+| `db_page_content` | DB各行のページ本文を `_body` カラムに格納 | `true` |
 | `exclude_paths` | rglob検索から除外するパス文字列 | `["_sync", "_archived"]` |
 
 ## Data Model

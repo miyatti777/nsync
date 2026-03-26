@@ -149,7 +149,7 @@ exclude_paths:
 | `label` | 表示用ラベル | Notionタイトル or ディレクトリ名 |
 | `crawl_max_depth` | クロールの最大深度 | `10` |
 | `rate_limit_delay` | API呼び出し間の待機秒数 | `0.35` |
-| `db_page_content` | DB各行のページ本文を `_body` カラムに格納 | `false` |
+| `db_page_content` | DB各行のページ本文を `_body` カラムに格納 | `true` |
 | `exclude_paths` | 検索から除外するパス | `["_sync", "_archived"]` |
 
 ## 対応ブロックタイプ
@@ -198,7 +198,7 @@ db_page_content: true
 SELECT Name, substr(_body, 1, 200) FROM data WHERE _body LIKE '%Sprint%'
 ```
 
-デフォルトは `false`（プロパティのみ）。大量レコードの DB では API コール数が増加するため、必要な場合のみ有効化してください。
+デフォルトは `true`。大量レコードの DB で無効にしたい場合は `db_page_content: false` を設定してください。
 
 ### Pull (単一ファイル取得)
 

@@ -45,13 +45,20 @@ class Config:
         self.max_retries = 3
         self.retry_backoff = 2.0
         self.exclude_paths = ["_sync", "_archived"]
-        self.db_page_content = False
+        self.db_page_content = True
 
 CFG = Config()
 
 TOKEN = ""
 API_VERSION = ""
 HEADERS = {}
+
+_api_stats = {"calls": 0, "rate_limits": 0, "errors": 0, "skipped": 0}
+
+
+class RateLimitExhausted(Exception):
+    """Raised when too many consecutive 429s indicate we should stop."""
+    pass
 
 
 def init_api():
@@ -88,7 +95,7 @@ def load_config(config_path):
     CFG.max_retries = data.get("max_retries", 3)
     CFG.retry_backoff = data.get("retry_backoff", 2.0)
     CFG.exclude_paths = data.get("exclude_paths", ["_sync", "_archived"])
-    CFG.db_page_content = data.get("db_page_content", False)
+    CFG.db_page_content = data.get("db_page_content", True)
 
 
 def _parse_simple_yaml(text):
@@ -162,29 +169,52 @@ def extract_page_id_from_url(url):
 # Notion API
 # ==========================================
 
-def api_get(url, retries=None):
+def _api_request(url, method="GET", body_dict=None, retries=None):
+    """Unified API request with Retry-After support and rate limit tracking."""
     if retries is None:
         retries = CFG.max_retries
+    data_bytes = json.dumps(body_dict).encode() if body_dict else None
+    consecutive_429 = 0
+
     for attempt in range(retries):
-        req = urllib.request.Request(url, headers=HEADERS)
+        req = urllib.request.Request(url, data=data_bytes, headers=HEADERS, method=method)
+        _api_stats["calls"] += 1
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as e:
             if e.code == 429:
-                wait = CFG.retry_backoff ** (attempt + 1)
-                print("  Rate limited. Waiting %ss..." % wait, flush=True)
+                _api_stats["rate_limits"] += 1
+                consecutive_429 += 1
+                retry_after = e.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        wait = max(float(retry_after), 1.0)
+                    except ValueError:
+                        wait = CFG.retry_backoff ** (attempt + 1)
+                else:
+                    wait = CFG.retry_backoff ** (attempt + 1)
+                print("  Rate limited (429 #%d). Waiting %.1fs..." % (
+                    _api_stats["rate_limits"], wait), flush=True)
+                if consecutive_429 >= retries:
+                    _api_stats["errors"] += 1
+                    raise RateLimitExhausted(
+                        "Too many consecutive 429s (%d). Stopping to avoid API ban." % consecutive_429)
                 time.sleep(wait)
                 continue
             elif e.code == 404:
                 return None
             else:
+                _api_stats["errors"] += 1
                 print("  HTTP %d on attempt %d: %s" % (e.code, attempt + 1, url), flush=True)
                 if attempt < retries - 1:
                     time.sleep(CFG.retry_backoff ** attempt)
                     continue
                 return None
+        except RateLimitExhausted:
+            raise
         except Exception as e:
+            _api_stats["errors"] += 1
             print("  Error on attempt %d: %s" % (attempt + 1, e), flush=True)
             if attempt < retries - 1:
                 time.sleep(CFG.retry_backoff ** attempt)
@@ -193,87 +223,20 @@ def api_get(url, retries=None):
     return None
 
 
+def api_get(url, retries=None):
+    return _api_request(url, "GET", retries=retries)
+
+
 def api_post(url, body_dict, retries=None):
-    if retries is None:
-        retries = CFG.max_retries
-    body = json.dumps(body_dict).encode()
-    for attempt in range(retries):
-        req = urllib.request.Request(url, data=body, headers=HEADERS, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                wait = CFG.retry_backoff ** (attempt + 1)
-                time.sleep(wait)
-                continue
-            elif e.code == 404:
-                return None
-            else:
-                if attempt < retries - 1:
-                    time.sleep(CFG.retry_backoff ** attempt)
-                    continue
-                return None
-        except Exception as e:
-            if attempt < retries - 1:
-                time.sleep(CFG.retry_backoff ** attempt)
-                continue
-            return None
-    return None
+    return _api_request(url, "POST", body_dict, retries=retries)
 
 
 def api_patch(url, body_dict, retries=None):
-    if retries is None:
-        retries = CFG.max_retries
-    body = json.dumps(body_dict).encode()
-    for attempt in range(retries):
-        req = urllib.request.Request(url, data=body, headers=HEADERS, method="PATCH")
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                wait = CFG.retry_backoff ** (attempt + 1)
-                time.sleep(wait)
-                continue
-            else:
-                print("  HTTP %d on attempt %d: %s" % (e.code, attempt + 1, url), flush=True)
-                if attempt < retries - 1:
-                    time.sleep(CFG.retry_backoff ** attempt)
-                    continue
-                return None
-        except Exception as e:
-            if attempt < retries - 1:
-                time.sleep(CFG.retry_backoff ** attempt)
-                continue
-            return None
-    return None
+    return _api_request(url, "PATCH", body_dict, retries=retries)
 
 
 def api_delete(url, retries=None):
-    if retries is None:
-        retries = CFG.max_retries
-    for attempt in range(retries):
-        req = urllib.request.Request(url, headers=HEADERS, method="DELETE")
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                wait = CFG.retry_backoff ** (attempt + 1)
-                time.sleep(wait)
-                continue
-            else:
-                if attempt < retries - 1:
-                    time.sleep(CFG.retry_backoff ** attempt)
-                    continue
-                return None
-        except Exception as e:
-            if attempt < retries - 1:
-                time.sleep(CFG.retry_backoff ** attempt)
-                continue
-            return None
-    return None
+    return _api_request(url, "DELETE", retries=retries)
 
 
 # ==========================================
@@ -350,50 +313,57 @@ def deep_crawl(block_id, path="", depth=0, resume_items=None, resume_queue=None)
     count = len(items)
     last_checkpoint = count
 
-    while queue:
-        current_id, current_path, current_depth = queue.pop(0)
+    try:
+        while queue:
+            current_id, current_path, current_depth = queue.pop(0)
 
-        blocks = get_blocks(current_id)
-        for b in blocks:
-            t = b["type"]
-            bid = b["id"]
-            hc = b.get("has_children", False)
+            blocks = get_blocks(current_id)
+            for b in blocks:
+                t = b["type"]
+                bid = b["id"]
+                hc = b.get("has_children", False)
 
-            if t == "child_page":
-                title = b["child_page"]["title"]
-                full_path = current_path + "/" + title if current_path else title
-                if bid not in visited:
-                    visited.add(bid)
-                    count += 1
-                    if count % 10 == 0:
-                        print("  ... found %d items (depth=%d)" % (count, current_depth), flush=True)
-                    items.append({
-                        "type": "page", "title": title, "path": full_path,
-                        "id": bid, "depth": current_depth, "has_children": hc
-                    })
-                    if hc and current_depth < CFG.crawl_max_depth:
-                        queue.append((bid, full_path, current_depth + 1))
-            elif t == "child_database":
-                title = b["child_database"]["title"]
-                full_path = current_path + "/" + title if current_path else title
-                if bid not in visited:
-                    visited.add(bid)
-                    count += 1
-                    items.append({
-                        "type": "db", "title": title, "path": full_path,
-                        "id": bid, "depth": current_depth
-                    })
-            elif hc and current_depth < CFG.crawl_max_depth:
-                if bid not in visited:
-                    visited.add(bid)
-                    queue.append((bid, current_path, current_depth))
+                if t == "child_page":
+                    title = b["child_page"]["title"]
+                    full_path = current_path + "/" + title if current_path else title
+                    if bid not in visited:
+                        visited.add(bid)
+                        count += 1
+                        if count % 10 == 0:
+                            print("  ... found %d items (depth=%d)" % (count, current_depth), flush=True)
+                        items.append({
+                            "type": "page", "title": title, "path": full_path,
+                            "id": bid, "depth": current_depth, "has_children": hc
+                        })
+                        if hc and current_depth < CFG.crawl_max_depth:
+                            queue.append((bid, full_path, current_depth + 1))
+                elif t == "child_database":
+                    title = b["child_database"]["title"]
+                    full_path = current_path + "/" + title if current_path else title
+                    if bid not in visited:
+                        visited.add(bid)
+                        count += 1
+                        items.append({
+                            "type": "db", "title": title, "path": full_path,
+                            "id": bid, "depth": current_depth
+                        })
+                elif hc and current_depth < CFG.crawl_max_depth:
+                    if bid not in visited:
+                        visited.add(bid)
+                        queue.append((bid, current_path, current_depth))
 
-            if count - last_checkpoint >= CHECKPOINT_INTERVAL:
-                _save_checkpoint(items, queue)
-                last_checkpoint = count
-                print("  [checkpoint saved: %d items, %d remaining in queue]" % (count, len(queue)), flush=True)
+                if count - last_checkpoint >= CHECKPOINT_INTERVAL:
+                    _save_checkpoint(items, queue)
+                    last_checkpoint = count
+                    print("  [checkpoint saved: %d items, %d remaining in queue]" % (count, len(queue)), flush=True)
 
-        time.sleep(CFG.rate_limit_delay)
+            time.sleep(CFG.rate_limit_delay)
+    except RateLimitExhausted as e:
+        print("  RATE LIMIT: %s" % e, flush=True)
+        _save_checkpoint(items, queue)
+        print("  [emergency checkpoint saved: %d items, %d remaining in queue]" % (count, len(queue)), flush=True)
+        print("  Re-run the same command to resume from checkpoint.", flush=True)
+        raise
 
     _remove_checkpoint()
     return items
@@ -1978,5 +1948,26 @@ def print_usage():
     print('  query <db> "SQL"   Query a database', flush=True)
 
 
+def _print_api_stats():
+    s = _api_stats
+    if s["calls"] == 0:
+        return
+    parts = ["API: %d calls" % s["calls"]]
+    if s["rate_limits"]:
+        parts.append("%d rate-limited" % s["rate_limits"])
+    if s["errors"]:
+        parts.append("%d errors" % s["errors"])
+    if s["skipped"]:
+        parts.append("%d skipped" % s["skipped"])
+    print("[%s]" % ", ".join(parts), flush=True)
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RateLimitExhausted as e:
+        print("\nFATAL: %s" % e, flush=True)
+        print("Checkpoint saved. Re-run the same command to resume.", flush=True)
+        sys.exit(2)
+    finally:
+        _print_api_stats()
