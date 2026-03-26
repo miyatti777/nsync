@@ -75,10 +75,10 @@ cd <output_dir>
 | `sync --force` | Yes | 全ページ強制再ダウンロード |
 | `sync --full` | Yes | `--refresh` + `--force`（完全再同期） |
 | `sync --dry-run` | Yes | 変更検出のみ（ダウンロードしない） |
-| `pull <file.md>` | Yes | 特定ページをNotionから再取得 |
-| `pull --dry-run <file.md>` | Yes | Notion側ブロック一覧のプレビュー |
-| `push <file.md>` | Yes | ローカルMDをNotionに反映 |
-| `push --dry-run <file.md>` | No | Push内容のプレビュー（書き込みなし） |
+| `pull <file>` | Yes | 特定ページ/DBをNotionから再取得（.md/.db対応） |
+| `pull --dry-run <file>` | Yes | Notion側の内容プレビュー |
+| `push <file>` | Yes | ローカルファイルをNotionに反映（.md/.db対応） |
+| `push --dry-run <file>` | Yes* | Push内容のプレビュー（*md は API不要） |
 | `status` | No | 同期状態のサマリー表示 |
 | `init-state` | No | 既存ファイルから同期状態を再構築 |
 | `db-list` | No | SQLiteデータベース一覧 |
@@ -148,13 +148,23 @@ Notion のインライン装飾を正しくMarkdownに変換:
 
 言語エイリアス対応（`py`→`python`, `js`→`javascript` 等）。長文は1800文字単位でチャンク分割（Notion制限対応）。
 
+### DB Push (SQLite → Notion)
+
+`.db` ファイルを指定すると、SQLite の行データを Notion DB に反映:
+- `_notion_page_id` がある行 → プロパティ値を更新
+- `_notion_page_id` が空の行 → 新規行として作成
+
+対応プロパティ型: title, rich_text, number, select, multi_select, date, checkbox, url, status, email, phone_number。
+formula, rollup, relation 等の算出系は読み取り専用のためスキップ。
+
 ### dry-run モード
 
 ```bash
-./nsync.sh push --dry-run path/to/page.md
+./nsync.sh push --dry-run path/to/page.md   # ページ
+./nsync.sh push --dry-run path/to/db.db     # DB
 ```
 
-Notionに書き込まず、変換されるブロック一覧をプレビュー表示。
+Notionに書き込まず、変更内容をプレビュー表示。
 
 ## Config (.nsync.yaml)
 

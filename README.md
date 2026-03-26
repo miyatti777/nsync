@@ -98,10 +98,10 @@ cd projects/my-project
 | `sync --force` | Yes | 全ページ強制再ダウンロード |
 | `sync --full` | Yes | `--refresh` + `--force`（完全再同期） |
 | `sync --dry-run` | Yes | 変更検出のみ（ダウンロードしない） |
-| `pull <file.md>` | Yes | 特定ページをNotionから再取得 |
-| `pull --dry-run <file.md>` | Yes | Notion側ブロック一覧のプレビュー |
-| `push <file.md>` | Yes | ローカルMDをNotionに反映 |
-| `push --dry-run <file.md>` | No | Push内容のプレビュー |
+| `pull <file>` | Yes | 特定ページ/DBを再取得（.md/.db 対応） |
+| `pull --dry-run <file>` | Yes | Notion側の内容プレビュー |
+| `push <file>` | Yes | ローカルファイルをNotion反映（.md/.db 対応） |
+| `push --dry-run <file>` | Yes | Push内容のプレビュー |
 | `status` | No | 同期状態のサマリー表示 |
 | `init-state` | No | 既存ファイルから同期状態を再構築 |
 | `db-list` | No | SQLiteデータベース一覧 |
@@ -200,17 +200,33 @@ SELECT Name, substr(_body, 1, 200) FROM data WHERE _body LIKE '%Sprint%'
 
 デフォルトは `false`（プロパティのみ）。大量レコードの DB では API コール数が増加するため、必要な場合のみ有効化してください。
 
-### Pull (単一ページ取得)
+### Pull (単一ファイル取得)
 
-特定ページだけをNotionから再取得:
+特定のページまたは DB を Notion から再取得:
 
 ```bash
-./nsync.sh pull --dry-run path/to/page.md   # プレビュー（Notion側のブロック一覧を表示）
-./nsync.sh pull path/to/page.md              # 実行（ローカルファイルを上書き更新）
+./nsync.sh pull --dry-run path/to/page.md   # ページのプレビュー
+./nsync.sh pull path/to/page.md              # ページを上書き更新
+
+./nsync.sh pull --dry-run path/to/db.db     # DB のプレビュー（行数・プロパティ一覧）
+./nsync.sh pull path/to/db.db               # DB を再取得して上書き
 ```
 
 `sync` が全ページの差分同期なのに対し、`pull` は指定した1ファイルだけを即座に更新します。
-`push` と対になるコマンドです。
+
+### DB Push (SQLite → Notion)
+
+SQLite の行データを Notion DB に反映:
+
+```bash
+./nsync.sh push --dry-run path/to/db.db    # プレビュー（更新/新規件数を表示）
+./nsync.sh push path/to/db.db              # 実行
+```
+
+- `_notion_page_id` がある行 → プロパティ値を更新（PATCH）
+- `_notion_page_id` が空の行 → 新規行として作成（POST）
+- 対応型: title, rich_text, number, select, multi_select, date, checkbox, url, status, email, phone_number
+- 読み取り専用プロパティ（formula, rollup, relation 等）は自動スキップ
 
 ## nsync.sh の発見ロジック
 

@@ -752,6 +752,72 @@ def fetch_database_to_sqlite(db_id, db_title, db_path):
     return len(all_rows)
 
 
+def _read_db_metadata(db_path):
+    """Read _metadata table from a .db file."""
+    conn = sqlite3.connect(str(db_path))
+    c = conn.cursor()
+    try:
+        c.execute("SELECT key, value FROM _metadata")
+        meta = dict(c.fetchall())
+    except sqlite3.Error:
+        meta = {}
+    conn.close()
+    return meta
+
+
+def fetch_db_schema(db_id):
+    """Fetch property name -> type mapping from Notion database schema."""
+    data = api_get("https://api.notion.com/v1/databases/%s" % db_id)
+    if not data:
+        return {}
+    schema = {}
+    for name, prop in data.get("properties", {}).items():
+        schema[name] = prop.get("type", "")
+    return schema
+
+
+READONLY_PROP_TYPES = frozenset([
+    "formula", "rollup", "relation", "created_time", "last_edited_time",
+    "created_by", "last_edited_by", "unique_id", "verification",
+])
+
+
+def build_property_payload(prop_name, text_value, prop_type):
+    """Convert a text value back to Notion property format. Returns None for unsupported types."""
+    if prop_type in READONLY_PROP_TYPES:
+        return None
+    if not text_value and prop_type not in ("checkbox",):
+        return None
+
+    if prop_type == "title":
+        return {"title": [{"text": {"content": text_value}}]}
+    elif prop_type == "rich_text":
+        return {"rich_text": [{"text": {"content": text_value}}]}
+    elif prop_type == "number":
+        try:
+            return {"number": float(text_value)}
+        except (ValueError, TypeError):
+            return None
+    elif prop_type == "select":
+        return {"select": {"name": text_value}}
+    elif prop_type == "multi_select":
+        names = [n.strip() for n in text_value.split(",") if n.strip()]
+        return {"multi_select": [{"name": n} for n in names]}
+    elif prop_type == "date":
+        return {"date": {"start": text_value}}
+    elif prop_type == "checkbox":
+        return {"checkbox": text_value in ("True", "true", "1", True)}
+    elif prop_type == "url":
+        return {"url": text_value or None}
+    elif prop_type == "status":
+        return {"status": {"name": text_value}}
+    elif prop_type == "email":
+        return {"email": text_value or None}
+    elif prop_type == "phone_number":
+        return {"phone_number": text_value or None}
+    return None
+
+
 # ==========================================
 # Sync State
 # ==========================================
@@ -1003,11 +1069,68 @@ def markdown_to_notion_blocks(md_text):
     return blocks
 
 
+def _cmd_pull_db(db_path, dry_run=False):
+    """Pull (re-fetch) a single .db file from Notion."""
+    meta = _read_db_metadata(db_path)
+    db_id = meta.get("notion_db_id", "")
+    db_title = meta.get("db_title", db_path.stem)
+    db_notion_path = meta.get("notion_db_path", "")
+
+    if not db_id:
+        print("ERROR: No notion_db_id in _metadata of %s" % db_path, flush=True)
+        return False
+
+    if dry_run:
+        print("=== DB Pull DRY RUN ===", flush=True)
+        print("File: %s" % db_path, flush=True)
+        print("Notion DB ID: %s" % db_id, flush=True)
+        print("Title: %s" % db_title, flush=True)
+
+        payload = {"page_size": 1}
+        data = api_post("https://api.notion.com/v1/databases/%s/query" % db_id, payload)
+        if data:
+            # Notion doesn't return total count directly; estimate via has_more
+            print("Querying Notion for row count...", flush=True)
+            total = 0
+            cursor = None
+            while True:
+                p = {"page_size": 100}
+                if cursor:
+                    p["start_cursor"] = cursor
+                d = api_post("https://api.notion.com/v1/databases/%s/query" % db_id, p)
+                if not d:
+                    break
+                total += len(d.get("results", []))
+                if not d.get("has_more"):
+                    break
+                cursor = d.get("next_cursor")
+                time.sleep(CFG.rate_limit_delay)
+            print("Notion rows: %d" % total, flush=True)
+
+        schema = fetch_db_schema(db_id)
+        print("Properties: %s" % ", ".join(sorted(schema.keys())), flush=True)
+        print("db_page_content: %s" % CFG.db_page_content, flush=True)
+        print("\n(dry-run: local file not modified)", flush=True)
+        return True
+
+    print("=== DB Pull from Notion ===", flush=True)
+    print("File: %s" % db_path, flush=True)
+    print("Notion DB ID: %s" % db_id, flush=True)
+
+    count = fetch_database_to_sqlite(db_id, db_title, db_notion_path)
+    print("Downloaded: %d rows" % count, flush=True)
+    print("DB Pull complete.", flush=True)
+    return True
+
+
 def cmd_pull(filepath, dry_run=False):
     p = Path(filepath)
     if not p.exists():
         print("ERROR: File not found: %s" % filepath, flush=True)
         return False
+
+    if p.suffix == ".db":
+        return _cmd_pull_db(p, dry_run)
 
     text = p.read_text(encoding="utf-8")
     fm, body = parse_front_matter(text)
@@ -1087,11 +1210,131 @@ def cmd_pull(filepath, dry_run=False):
     return True
 
 
+def _cmd_push_db(db_path, dry_run=False):
+    """Push a .db file to Notion (update existing rows + create new rows)."""
+    meta = _read_db_metadata(db_path)
+    db_id = meta.get("notion_db_id", "")
+    db_title = meta.get("db_title", db_path.stem)
+
+    if not db_id:
+        print("ERROR: No notion_db_id in _metadata of %s" % db_path, flush=True)
+        return False
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    try:
+        c.execute("SELECT * FROM data")
+        rows = c.fetchall()
+        columns = [desc[0] for desc in c.description]
+    except sqlite3.Error as e:
+        print("ERROR: %s" % e, flush=True)
+        conn.close()
+        return False
+    conn.close()
+
+    schema = fetch_db_schema(db_id)
+    if not schema:
+        print("ERROR: Could not fetch schema for DB %s" % db_id, flush=True)
+        return False
+
+    skip_cols = {"_notion_page_id", "_created_time", "_last_edited_time", "_body"}
+    writable_cols = [c for c in columns if c not in skip_cols and c in schema
+                     and schema[c] not in READONLY_PROP_TYPES]
+
+    updates = []
+    creates = []
+    for row in rows:
+        page_id = row["_notion_page_id"] if "_notion_page_id" in columns else ""
+        props = {}
+        for col in writable_cols:
+            val = row[col] or ""
+            payload = build_property_payload(col, val, schema[col])
+            if payload is not None:
+                props[col] = payload
+        if page_id:
+            updates.append((page_id, props, row))
+        else:
+            creates.append((props, row))
+
+    if dry_run:
+        print("=== DB Push DRY RUN ===", flush=True)
+        print("File: %s" % db_path, flush=True)
+        print("Notion DB: %s (%s)" % (db_title, db_id), flush=True)
+        print("Schema: %s" % ", ".join("%s(%s)" % (k, v) for k, v in sorted(schema.items())
+                                        if v not in READONLY_PROP_TYPES), flush=True)
+        print("", flush=True)
+        print("Updates: %d rows (existing)" % len(updates), flush=True)
+        for pid, props, row in updates[:5]:
+            title_col = next((k for k, v in schema.items() if v == "title"), None)
+            title = row[title_col] if title_col and title_col in columns else pid[:12]
+            changed = [k for k in props]
+            print("  [UPD] %s: %s" % (title, ", ".join(changed[:5])), flush=True)
+        if len(updates) > 5:
+            print("  ... and %d more" % (len(updates) - 5), flush=True)
+
+        print("Creates: %d rows (new)" % len(creates), flush=True)
+        for props, row in creates[:5]:
+            title_col = next((k for k, v in schema.items() if v == "title"), None)
+            title = ""
+            if title_col and title_col in columns:
+                title = row[title_col] or "(untitled)"
+            print("  [NEW] %s" % title, flush=True)
+        if len(creates) > 5:
+            print("  ... and %d more" % (len(creates) - 5), flush=True)
+
+        print("\n(dry-run: no changes written to Notion)", flush=True)
+        return True
+
+    print("=== DB Push to Notion ===", flush=True)
+    print("File: %s" % db_path, flush=True)
+    print("Notion DB: %s" % db_title, flush=True)
+
+    success = 0
+    errors = 0
+
+    if updates:
+        print("Updating %d rows..." % len(updates), flush=True)
+        for i, (pid, props, row) in enumerate(updates):
+            if not props:
+                continue
+            result = api_patch("https://api.notion.com/v1/pages/%s" % pid, {"properties": props})
+            if result:
+                success += 1
+            else:
+                errors += 1
+            time.sleep(CFG.rate_limit_delay)
+            if (i + 1) % 20 == 0:
+                print("  ... updated %d/%d" % (i + 1, len(updates)), flush=True)
+
+    if creates:
+        print("Creating %d new rows..." % len(creates), flush=True)
+        for i, (props, row) in enumerate(creates):
+            body = {
+                "parent": {"database_id": db_id},
+                "properties": props,
+            }
+            result = api_post("https://api.notion.com/v1/pages", body)
+            if result:
+                success += 1
+            else:
+                errors += 1
+            time.sleep(CFG.rate_limit_delay)
+            if (i + 1) % 20 == 0:
+                print("  ... created %d/%d" % (i + 1, len(creates)), flush=True)
+
+    print("Push complete. Success: %d, Errors: %d" % (success, errors), flush=True)
+    return errors == 0
+
+
 def cmd_push(filepath, dry_run=False):
     p = Path(filepath)
     if not p.exists():
         print("ERROR: File not found: %s" % filepath, flush=True)
         return False
+
+    if p.suffix == ".db":
+        return _cmd_push_db(p, dry_run)
 
     text = p.read_text(encoding="utf-8")
     fm, body = parse_front_matter(text)
@@ -1727,8 +1970,8 @@ def print_usage():
     print("  sync --force       Force re-download all pages", flush=True)
     print("  sync --full         Refresh + force (complete re-sync)", flush=True)
     print("  sync --dry-run     Show what would be synced", flush=True)
-    print("  pull <file.md>     Pull single page from Notion", flush=True)
-    print("  push <file.md>     Push local MD to Notion", flush=True)
+    print("  pull <file>        Pull single file from Notion (.md or .db)", flush=True)
+    print("  push <file>        Push local file to Notion (.md or .db)", flush=True)
     print("  status             Show sync status", flush=True)
     print("  init-state         Init state from existing files", flush=True)
     print("  db-list            List all databases", flush=True)
