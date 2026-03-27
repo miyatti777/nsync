@@ -10,6 +10,7 @@
 - **Pull / Push**: 特定ページの個別取得・反映（インライン装飾対応）
 - **Refresh**: Notionのページツリーを最新化してから同期（新規・削除ページの検出）
 - **DB → SQLite**: NotionデータベースをSQLiteファイルに変換し、SQLクエリ可能
+- **New Page Creation**: ローカルでページ構造を作成→Notionに一括反映（scaffold + recursive push）
 - **Claude Skill**: AIアシスタント（Claude / Cursor）から直接呼び出し可能
 
 ## インストール
