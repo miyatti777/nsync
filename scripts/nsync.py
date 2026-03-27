@@ -290,6 +290,119 @@ def api_delete(url, retries=None):
 
 
 # ==========================================
+# File Upload API (requires Notion-Version >= 2026-03-11)
+# ==========================================
+
+_FILE_UPLOAD_API_VERSION = "2026-03-11"
+
+_MIME_MAP = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml",
+    ".tiff": "image/tiff", ".bmp": "image/bmp", ".heic": "image/heic",
+    ".pdf": "application/pdf",
+    ".mp4": "video/mp4", ".mov": "video/quicktime", ".avi": "video/x-msvideo",
+    ".mkv": "video/x-matroska", ".webm": "video/webm",
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
+    ".flac": "audio/flac", ".aac": "audio/aac", ".m4a": "audio/mp4",
+}
+
+
+def _upload_file_to_notion(local_path, purpose="block_content"):
+    """Upload a local file to Notion using the File Upload API (3-step).
+    Returns file_upload_id on success, None on failure."""
+    local_path = Path(local_path)
+    if not local_path.exists():
+        print("  ERROR: File not found for upload: %s" % local_path, flush=True)
+        return None
+
+    file_size = local_path.stat().st_size
+    if file_size > 20 * 1024 * 1024:
+        print("  WARN: File >20MB, skipping (multi-part not yet supported): %s" % local_path.name, flush=True)
+        return None
+
+    ext = local_path.suffix.lower()
+    content_type = _MIME_MAP.get(ext, "application/octet-stream")
+
+    upload_headers = {
+        "Authorization": "Bearer " + TOKEN,
+        "Notion-Version": _FILE_UPLOAD_API_VERSION,
+        "Content-Type": "application/json",
+    }
+
+    # Step 1: Create file upload object
+    create_body = json.dumps({
+        "mode": "single_part",
+        "filename": local_path.name,
+        "content_type": content_type,
+        "purpose": purpose,
+    }).encode()
+
+    req = urllib.request.Request(
+        "https://api.notion.com/v1/file-uploads",
+        data=create_body, headers=upload_headers, method="POST"
+    )
+    _api_stats["calls"] += 1
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            create_resp = json.loads(resp.read())
+    except Exception as e:
+        print("  ERROR: File upload create failed: %s" % e, flush=True)
+        _api_stats["errors"] += 1
+        return None
+
+    file_upload_id = create_resp.get("id")
+    if not file_upload_id:
+        print("  ERROR: No file_upload_id in response", flush=True)
+        return None
+
+    # Step 2: Send binary data (multipart/form-data)
+    import uuid as _uuid
+    boundary = "----nsync" + _uuid.uuid4().hex[:16]
+    file_data = local_path.read_bytes()
+    body_parts = []
+    body_parts.append(("--%s\r\n" % boundary).encode())
+    body_parts.append(('Content-Disposition: form-data; name="file"; filename="%s"\r\n' % local_path.name).encode())
+    body_parts.append(("Content-Type: %s\r\n\r\n" % content_type).encode())
+    body_parts.append(file_data)
+    body_parts.append(("\r\n--%s--\r\n" % boundary).encode())
+    multipart_body = b"".join(body_parts)
+
+    send_headers = {
+        "Authorization": "Bearer " + TOKEN,
+        "Notion-Version": _FILE_UPLOAD_API_VERSION,
+        "Content-Type": "multipart/form-data; boundary=%s" % boundary,
+    }
+    send_url = "https://api.notion.com/v1/file-uploads/%s/send" % file_upload_id
+    req2 = urllib.request.Request(send_url, data=multipart_body, headers=send_headers, method="POST")
+    _api_stats["calls"] += 1
+    try:
+        with urllib.request.urlopen(req2, timeout=120) as resp:
+            json.loads(resp.read())
+    except Exception as e:
+        print("  ERROR: File upload send failed: %s" % e, flush=True)
+        _api_stats["errors"] += 1
+        return None
+
+    print("  Uploaded: %s (%s)" % (local_path.name, content_type), flush=True)
+    return file_upload_id
+
+
+def _make_file_upload_block(file_upload_id, btype="image", caption_rt=None):
+    """Create a Notion block referencing an uploaded file."""
+    block = {
+        "object": "block",
+        "type": btype,
+        btype: {
+            "type": "file_upload",
+            "file_upload": {"id": file_upload_id},
+        }
+    }
+    if caption_rt:
+        block[btype]["caption"] = caption_rt
+    return block
+
+
+# ==========================================
 # Tree Crawl
 # ==========================================
 
@@ -560,6 +673,50 @@ def _block_to_md(b, depth=0):
         embed_url = block_data.get("url", "")
         if embed_url:
             md_line = "[embed](%s)" % embed_url
+    elif btype == "pdf":
+        pdf_info = block_data
+        pdf_url = ""
+        if pdf_info.get("type") == "file":
+            pdf_url = pdf_info.get("file", {}).get("url", "")
+        elif pdf_info.get("type") == "external":
+            pdf_url = pdf_info.get("external", {}).get("url", "")
+        caption_rt = pdf_info.get("caption", [])
+        caption = rich_text_to_markdown(caption_rt) if caption_rt else "PDF"
+        if pdf_url:
+            md_line = "[📎 %s](%s)" % (caption, pdf_url)
+    elif btype == "video":
+        vid_info = block_data
+        vid_url = ""
+        if vid_info.get("type") == "file":
+            vid_url = vid_info.get("file", {}).get("url", "")
+        elif vid_info.get("type") == "external":
+            vid_url = vid_info.get("external", {}).get("url", "")
+        caption_rt = vid_info.get("caption", [])
+        caption = rich_text_to_markdown(caption_rt) if caption_rt else "Video"
+        if vid_url:
+            md_line = "[🎬 %s](%s)" % (caption, vid_url)
+    elif btype == "audio":
+        aud_info = block_data
+        aud_url = ""
+        if aud_info.get("type") == "file":
+            aud_url = aud_info.get("file", {}).get("url", "")
+        elif aud_info.get("type") == "external":
+            aud_url = aud_info.get("external", {}).get("url", "")
+        caption_rt = aud_info.get("caption", [])
+        caption = rich_text_to_markdown(caption_rt) if caption_rt else "Audio"
+        if aud_url:
+            md_line = "[🔊 %s](%s)" % (caption, aud_url)
+    elif btype == "file":
+        file_info = block_data
+        file_url = ""
+        if file_info.get("type") == "file":
+            file_url = file_info.get("file", {}).get("url", "")
+        elif file_info.get("type") == "external":
+            file_url = file_info.get("external", {}).get("url", "")
+        caption_rt = file_info.get("caption", [])
+        caption = rich_text_to_markdown(caption_rt) if caption_rt else "File"
+        if file_url:
+            md_line = "[📁 %s](%s)" % (caption, file_url)
     elif btype == "equation":
         expr = block_data.get("expression", "")
         if expr:
@@ -594,7 +751,102 @@ def _block_to_md(b, depth=0):
     return entries
 
 
-def fetch_page_blocks_as_text(page_id):
+def _extract_assets_from_blocks(blocks):
+    """Extract downloadable asset metadata from raw Notion blocks.
+    Returns list of dicts: {block_id, url, filename, btype}."""
+    assets = []
+    _MEDIA_BTYPES = ("image", "pdf", "video", "audio", "file")
+    for b in blocks:
+        btype = b["type"]
+        if btype not in _MEDIA_BTYPES:
+            continue
+        block_data = b.get(btype, {})
+        if block_data.get("type") != "file":
+            continue
+        file_url = block_data.get("file", {}).get("url", "")
+        if not file_url:
+            continue
+        block_id = b["id"].replace("-", "")[:12]
+        fname = _asset_filename_from_url(file_url, block_id, btype)
+        assets.append({"block_id": b["id"], "url": file_url, "filename": fname, "btype": btype})
+    return assets
+
+
+def _asset_filename_from_url(url, block_id_short, btype):
+    """Derive a local filename from the Notion S3 URL."""
+    from urllib.parse import urlparse, unquote
+    parsed = urlparse(url)
+    path_parts = parsed.path.rsplit("/", 1)
+    if len(path_parts) > 1:
+        raw_name = unquote(path_parts[-1])
+    else:
+        _EXT_MAP = {"image": ".png", "pdf": ".pdf", "video": ".mp4", "audio": ".mp3", "file": ".bin"}
+        raw_name = block_id_short + _EXT_MAP.get(btype, ".bin")
+    return block_id_short + "_" + re.sub(r'[^\w.\-]', '_', raw_name)
+
+
+def _download_file(url, dest_path):
+    """Download a file from URL to local path. Returns True on success."""
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(dest_path, "wb") as f:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+        return True
+    except Exception as e:
+        print("  WARN: Failed to download asset: %s" % e, flush=True)
+        return False
+
+
+def _download_page_assets(assets, page_dir):
+    """Download assets to page_dir/_assets/. Returns dict mapping url -> relative path.
+    Reuses existing files with same original name to prevent bloat from push→pull cycles."""
+    if not assets:
+        return {}
+    assets_dir = page_dir / "_assets"
+    url_to_relpath = {}
+
+    existing_by_suffix = {}
+    if assets_dir.exists():
+        for f in assets_dir.iterdir():
+            if f.is_file() and not f.name.startswith("."):
+                parts = f.name.split("_", 1)
+                if len(parts) > 1:
+                    existing_by_suffix[parts[1]] = f
+
+    for a in assets:
+        dest = assets_dir / a["filename"]
+        if dest.exists():
+            url_to_relpath[a["url"]] = "_assets/" + a["filename"]
+            continue
+
+        # Check if same original file exists under different block_id prefix
+        suffix = a["filename"].split("_", 1)[-1] if "_" in a["filename"] else a["filename"]
+        existing = existing_by_suffix.get(suffix)
+        if existing and existing.exists():
+            url_to_relpath[a["url"]] = "_assets/" + existing.name
+            continue
+
+        if _download_file(a["url"], dest):
+            url_to_relpath[a["url"]] = "_assets/" + a["filename"]
+            existing_by_suffix[suffix] = dest
+            print("    Asset: %s" % a["filename"], flush=True)
+    return url_to_relpath
+
+
+def _replace_asset_urls(md_text, url_map):
+    """Replace Notion S3 URLs in markdown text with local relative paths."""
+    for url, local_path in url_map.items():
+        md_text = md_text.replace(url, local_path)
+    return md_text
+
+
+def fetch_page_blocks_as_text(page_id, page_dir=None):
     blocks = []
     cursor = None
     while True:
@@ -609,6 +861,12 @@ def fetch_page_blocks_as_text(page_id):
             break
         cursor = data.get("next_cursor")
         time.sleep(CFG.rate_limit_delay)
+
+    # Extract and download assets if page_dir provided
+    assets = _extract_assets_from_blocks(blocks)
+    url_map = {}
+    if page_dir and assets:
+        url_map = _download_page_assets(assets, page_dir)
 
     COMPACT_TYPES = ("bulleted_list_item", "numbered_list_item", "to_do", "toggle",
                       "child_page", "child_database")
@@ -628,7 +886,10 @@ def fetch_page_blocks_as_text(page_id):
         else:
             result_parts.append("\n\n" + md_line)
 
-    return "".join(result_parts)
+    md_text = "".join(result_parts)
+    if url_map:
+        md_text = _replace_asset_urls(md_text, url_map)
+    return md_text
 
 
 def fetch_table_as_markdown(block_id):
@@ -704,6 +965,9 @@ def extract_property_value(prop):
             elif f.get("type") == "external":
                 urls.append(f.get("external", {}).get("url", ""))
         return ", ".join(urls)
+    elif ptype == "_files_with_download":
+        # Internal: used when db_assets_dir is set for downloading
+        return prop.get("_local_paths", "")
     else:
         return str(prop.get(ptype, ""))
 
@@ -789,6 +1053,36 @@ def _fetch_multi_datasource_rows(data_sources):
     return all_rows, all_props
 
 
+def _download_db_file_assets(rows, columns, db_assets_dir):
+    """Download file-type property files for DB rows to local _db_assets/ dir."""
+    from urllib.parse import urlparse, unquote
+    for row in rows:
+        page_id_short = row.get("_notion_page_id", "")[:12].replace("-", "")
+        for col in columns:
+            val = row.get(col, "")
+            if not val or not isinstance(val, str):
+                continue
+            urls = [u.strip() for u in val.split(", ")]
+            has_s3 = any("amazonaws.com" in u or "notion-static.com" in u for u in urls)
+            if not has_s3:
+                continue
+            local_paths = []
+            for url in urls:
+                if "amazonaws.com" not in url and "notion-static.com" not in url:
+                    local_paths.append(url)
+                    continue
+                fname = _asset_filename_from_url(url, page_id_short, "file")
+                dest = db_assets_dir / fname
+                if not dest.exists():
+                    if _download_file(url, dest):
+                        print("    DB Asset: %s" % fname, flush=True)
+                if dest.exists():
+                    local_paths.append("_db_assets/" + fname)
+                else:
+                    local_paths.append(url)
+            row[col] = ", ".join(local_paths)
+
+
 def fetch_database_to_sqlite(db_id, db_title, db_path):
     all_rows = []
     all_props = set()
@@ -842,6 +1136,10 @@ def fetch_database_to_sqlite(db_id, db_title, db_path):
 
     columns = sorted(all_props)
     sqlite_path = db_filepath(db_title, db_path)
+
+    # Download file assets from files properties
+    db_assets_dir = sqlite_path.parent / "_db_assets"
+    _download_db_file_assets(all_rows, columns, db_assets_dir)
 
     conn = sqlite3.connect(str(sqlite_path))
     c = conn.cursor()
@@ -1096,7 +1394,7 @@ def download_item(item, tree=None):
             return False
         filepath.parent.mkdir(parents=True, exist_ok=True)
 
-        md = fetch_page_blocks_as_text(item["id"])
+        md = fetch_page_blocks_as_text(item["id"], page_dir=filepath.parent)
         if tree:
             md = _resolve_child_links(md, item, tree)
         now = datetime.now().isoformat()
@@ -1225,6 +1523,7 @@ def _img_re_match(line):
 
 _WIKILINK_RE = re.compile('^\[\[(\U0001f4c4|\U0001f5c3\ufe0f)\s+(.+)\]\]$')
 _CHILD_LINK_RE = re.compile('^\[(\U0001f4c4|\U0001f5c3\ufe0f)\s+(.+?)\]\(<?(.+?)>?\)$')
+_MEDIA_LINK_RE = re.compile(r'^\[(📎|🎬|🔊|📁)\s+(.+?)\]\((.+?)\)$')
 
 
 def markdown_to_notion_blocks(md_text):
@@ -1307,10 +1606,30 @@ def markdown_to_notion_blocks(md_text):
             blocks.append({"object": "block", "type": "divider", "divider": {}})
         else:
             alt, img_url = _img_re_match(line)
+            ml = _MEDIA_LINK_RE.match(line.strip()) if not alt else None
             if img_url:
-                blocks.append({"object": "block", "type": "image",
-                    "image": {"type": "external", "external": {"url": img_url},
-                              "caption": parse_inline_markdown(alt) if alt else []}})
+                is_ext = img_url.startswith("http://") or img_url.startswith("https://")
+                if is_ext:
+                    blocks.append({"object": "block", "type": "image",
+                        "image": {"type": "external", "external": {"url": img_url},
+                                  "caption": parse_inline_markdown(alt) if alt else []}})
+                else:
+                    blocks.append({"_local_upload": True, "type": "image",
+                        "local_path": img_url,
+                        "caption_rt": parse_inline_markdown(alt) if alt else []})
+            elif ml:
+                icon, caption, url = ml.group(1), ml.group(2), ml.group(3)
+                _ICON_TO_BTYPE = {"📎": "pdf", "🎬": "video", "🔊": "audio", "📁": "file"}
+                media_type = _ICON_TO_BTYPE.get(icon, "file")
+                is_external = url.startswith("http://") or url.startswith("https://")
+                if is_external:
+                    blocks.append({"object": "block", "type": media_type,
+                        media_type: {"type": "external", "external": {"url": url},
+                                     "caption": parse_inline_markdown(caption) if caption else []}})
+                else:
+                    blocks.append({"_local_upload": True, "type": media_type,
+                        "local_path": url,
+                        "caption_rt": parse_inline_markdown(caption) if caption else []})
             elif line.strip():
                 blocks.append({"object": "block", "type": "paragraph",
                     "paragraph": {"rich_text": parse_inline_markdown(line.strip())}})
@@ -1442,7 +1761,7 @@ def cmd_pull(filepath, dry_run=False):
     print("File: %s" % filepath, flush=True)
     print("Notion ID: %s" % notion_id, flush=True)
 
-    md = fetch_page_blocks_as_text(notion_id)
+    md = fetch_page_blocks_as_text(notion_id, page_dir=p.parent)
 
     # Resolve child links if tree cache available
     if CFG.tree_json.exists() and notion_path:
@@ -2190,6 +2509,33 @@ def _append_blocks(page_id, blocks, after_id=None):
     return last_id
 
 
+def _resolve_local_uploads(blocks, page_dir, dry_run=False):
+    """Resolve _local_upload blocks by uploading files to Notion.
+    Returns blocks with uploads replaced by proper Notion blocks."""
+    resolved = []
+    for blk in blocks:
+        if not blk.get("_local_upload"):
+            resolved.append(blk)
+            continue
+        local_path = page_dir / blk["local_path"]
+        btype = blk["type"]
+        caption_rt = blk.get("caption_rt", [])
+        if not local_path.exists():
+            print("  WARN: Local file not found, skipping: %s" % blk["local_path"], flush=True)
+            continue
+        if dry_run:
+            resolved.append({"object": "block", "type": btype, "_local_upload_path": str(local_path),
+                             btype: {"type": "external", "external": {"url": "file://" + str(local_path)},
+                                     "caption": caption_rt}})
+            continue
+        file_upload_id = _upload_file_to_notion(local_path, purpose="block_content")
+        if file_upload_id:
+            resolved.append(_make_file_upload_block(file_upload_id, btype, caption_rt))
+        else:
+            print("  WARN: Upload failed, skipping: %s" % local_path.name, flush=True)
+    return resolved
+
+
 def cmd_push(filepath, dry_run=False, recursive=False):
     p = Path(filepath)
     if not p.exists():
@@ -2229,6 +2575,7 @@ def cmd_push(filepath, dry_run=False, recursive=False):
         return cmd_push_new(filepath, dry_run=dry_run, recursive=recursive)
 
     new_blocks = markdown_to_notion_blocks(body)
+    new_blocks = _resolve_local_uploads(new_blocks, p.parent, dry_run)
     has_wikilinks = any(blk.get("_wikilink") for blk in new_blocks)
 
     if dry_run:
