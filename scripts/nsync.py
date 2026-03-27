@@ -702,10 +702,78 @@ def db_filepath(db_title, db_path=""):
     return dir_path / (sanitize_table_name(db_title) + ".db")
 
 
+def _detect_multi_datasource(db_id):
+    """Check if a DB is multi-data-source by retrieving metadata with newer API."""
+    url = "https://api.notion.com/v1/databases/%s" % db_id
+    headers_v2 = dict(HEADERS)
+    headers_v2["Notion-Version"] = "2025-09-03"
+    req = urllib.request.Request(url, headers=headers_v2)
+    _api_stats["calls"] += 1
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+        sources = data.get("data_sources", [])
+        if sources:
+            return sources
+    except Exception:
+        pass
+    return []
+
+
+def _fetch_multi_datasource_rows(data_sources):
+    """Fetch rows from all data sources using v2025-09-03 API."""
+    all_rows = []
+    all_props = set()
+    headers_v2 = dict(HEADERS)
+    headers_v2["Notion-Version"] = "2025-09-03"
+
+    for ds in data_sources:
+        ds_id = ds.get("data_source_id", ds.get("id", ""))
+        if not ds_id:
+            continue
+        cursor = None
+        ds_count = 0
+        while True:
+            payload = {"page_size": 100}
+            if cursor:
+                payload["start_cursor"] = cursor
+            data_bytes = json.dumps(payload).encode()
+            url = "https://api.notion.com/v1/data_sources/%s/query" % ds_id
+            req = urllib.request.Request(url, data=data_bytes, headers=headers_v2, method="POST")
+            _api_stats["calls"] += 1
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = json.loads(resp.read())
+            except Exception as e:
+                print("    data_source %s error: %s" % (ds_id[:12], e), flush=True)
+                break
+
+            for page in data.get("results", []):
+                props = page.get("properties", {})
+                row = {"_notion_page_id": page["id"], "_data_source": ds_id}
+                for key, val in props.items():
+                    all_props.add(key)
+                    row[key] = extract_property_value(val)
+                row["_created_time"] = page.get("created_time", "")
+                row["_last_edited_time"] = page.get("last_edited_time", "")
+                all_rows.append(row)
+                ds_count += 1
+
+            if not data.get("has_more"):
+                break
+            cursor = data.get("next_cursor")
+            time.sleep(CFG.rate_limit_delay)
+
+        print("    data_source %s: %d rows" % (ds_id[:12], ds_count), flush=True)
+
+    return all_rows, all_props
+
+
 def fetch_database_to_sqlite(db_id, db_title, db_path):
     all_rows = []
     all_props = set()
     cursor = None
+    is_multi_ds = False
 
     while True:
         payload = {"page_size": 100}
@@ -713,6 +781,11 @@ def fetch_database_to_sqlite(db_id, db_title, db_path):
             payload["start_cursor"] = cursor
         data = api_post("https://api.notion.com/v1/databases/%s/query" % db_id, payload)
         if not data:
+            sources = _detect_multi_datasource(db_id)
+            if sources:
+                print("    Multi-data-source DB detected (%d sources)" % len(sources), flush=True)
+                all_rows, all_props = _fetch_multi_datasource_rows(sources)
+                is_multi_ds = True
             break
 
         for page in data.get("results", []):
@@ -756,6 +829,8 @@ def fetch_database_to_sqlite(db_id, db_title, db_path):
     c.execute("DROP TABLE IF EXISTS data")
 
     col_defs = ["_notion_page_id TEXT PRIMARY KEY"]
+    if is_multi_ds:
+        col_defs.append("_data_source TEXT")
     for col in columns:
         col_defs.append("[%s] TEXT" % col)
     col_defs.append("_created_time TEXT")
@@ -768,6 +843,8 @@ def fetch_database_to_sqlite(db_id, db_title, db_path):
     now = datetime.now().isoformat()
     for row in all_rows:
         vals = [row.get("_notion_page_id", "")]
+        if is_multi_ds:
+            vals.append(row.get("_data_source", ""))
         for col in columns:
             vals.append(row.get(col, ""))
         vals.append(row.get("_created_time", ""))
@@ -780,11 +857,14 @@ def fetch_database_to_sqlite(db_id, db_title, db_path):
     c.execute("""CREATE TABLE IF NOT EXISTS _metadata (
         key TEXT PRIMARY KEY, value TEXT
     )""")
-    for k, v in [
+    meta_items = [
         ("notion_db_id", db_id), ("notion_db_path", db_path),
         ("db_title", db_title), ("row_count", str(len(all_rows))),
         ("synced_at", now),
-    ]:
+    ]
+    if is_multi_ds:
+        meta_items.append(("multi_data_source", "true"))
+    for k, v in meta_items:
         c.execute("INSERT OR REPLACE INTO _metadata VALUES (?, ?)", (k, v))
 
     conn.commit()
