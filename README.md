@@ -452,6 +452,46 @@ Push → Pull → Push のサイクルでファイルが二重化しないよう
 - 同じ元ファイル名のアセットが `_assets/` にある場合、再ダウンロードをスキップ
 - block_id が変わっても、元ファイル名で既存ファイルをマッチング
 
+### 単体ファイルの自動ページ化
+
+Push 時、ページディレクトリ内に Markdown から参照されていない画像・PDF・動画・音声ファイルがある場合、自動的に子ページを作成して Push します:
+
+```bash
+# Push 前: photo.png が Page/ にあるが MD から参照なし
+Page/
+├── Page.md
+└── photo.png           ← 未参照
+
+# Push 後: 自動でページ化
+Page/
+├── Page.md             ← [📄 photo](photo/photo.md) が追記
+└── photo/
+    ├── photo.md        ← 画像だけを含むページ
+    └── _assets/
+        └── photo.png   ← 元ファイルが移動
+```
+
+- ファイル名がページタイトルになる
+- 元ファイルは子ページの `_assets/` に移動
+- 親ページの MD に子リンクが自動追記
+- Notion 上では子ページとして画像/PDFが表示される
+
+## リネーム検出
+
+Notion 側でページ名が変更された場合、`sync` 時にローカルファイル/フォルダを自動的にリネームします:
+
+```bash
+# Notion で "Meeting Notes" → "会議メモ" にリネーム
+./nsync.sh sync --refresh
+# → ローカルの Meeting Notes/ が 会議メモ/ に自動移動
+#    front matter の notion_path も更新
+```
+
+- `sync_state` の旧パスと `tree_cache` の現パスを比較して検出
+- フォルダ（コンテナページ）はフォルダごと移動
+- フラットページは .md ファイルを移動
+- front matter の `notion_path` も自動更新
+
 ## nsync.sh の発見ロジック
 
 `init` で生成される `nsync.sh` は、以下の順序で `nsync.py` を探します:
