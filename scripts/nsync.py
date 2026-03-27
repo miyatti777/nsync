@@ -1813,20 +1813,18 @@ def _load_tree_cache():
     if tc_path.exists():
         with open(tc_path) as f:
             data = json.load(f)
+        if isinstance(data, list):
+            return data
         return data.get("items", [])
     return []
 
 
 def _save_tree_cache_items(items):
-    """Save items to tree_cache.json, preserving other fields."""
+    """Save items to tree_cache.json (list format)."""
     tc_path = CFG.sync_dir / "tree_cache.json"
-    data = {}
-    if tc_path.exists():
-        with open(tc_path) as f:
-            data = json.load(f)
-    data["items"] = items
+    CFG.sync_dir.mkdir(parents=True, exist_ok=True)
     with open(tc_path, "w") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(items, f, ensure_ascii=False, indent=2)
 
 
 def _create_notion_page(parent_id, title, blocks=None):
