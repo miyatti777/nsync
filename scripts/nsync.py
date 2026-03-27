@@ -1068,6 +1068,8 @@ def _resolve_child_links(md_text, parent_item, tree):
         except ValueError:
             return match.group(0)
 
+        if " " in rel_path or "(" in rel_path or ")" in rel_path:
+            return "[%s %s](<%s>)" % (icon, title, rel_path)
         return "[%s %s](%s)" % (icon, title, rel_path)
 
     return re.sub('\[\[(\U0001f4c4|\U0001f5c3\ufe0f)\s+(.+?)\]\]', _replace, md_text)
@@ -1208,7 +1210,7 @@ def _img_re_match(line):
 
 
 _WIKILINK_RE = re.compile('^\[\[(\U0001f4c4|\U0001f5c3\ufe0f)\s+(.+)\]\]$')
-_CHILD_LINK_RE = re.compile('^\[(\U0001f4c4|\U0001f5c3\ufe0f)\s+(.+?)\]\((.+?)\)$')
+_CHILD_LINK_RE = re.compile('^\[(\U0001f4c4|\U0001f5c3\ufe0f)\s+(.+?)\]\(<?(.+?)>?\)$')
 
 
 def markdown_to_notion_blocks(md_text):
