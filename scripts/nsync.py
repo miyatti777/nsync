@@ -647,7 +647,7 @@ def _block_to_md(b, depth=0):
     elif btype == "quote":
         md_line = "> " + text
     elif btype == "callout":
-        icon = b.get(btype, {}).get("icon", {})
+        icon = b.get(btype, {}).get("icon") or {}
         emoji = icon.get("emoji", "") if icon.get("type") == "emoji" else ""
         md_line = "> %s %s" % (emoji, text)
     elif btype == "divider":
