@@ -596,7 +596,8 @@ def fetch_page_blocks_as_text(page_id):
         cursor = data.get("next_cursor")
         time.sleep(CFG.rate_limit_delay)
 
-    LIST_TYPES = ("bulleted_list_item", "numbered_list_item", "to_do", "toggle")
+    COMPACT_TYPES = ("bulleted_list_item", "numbered_list_item", "to_do", "toggle",
+                      "child_page", "child_database")
     entries = []
     for b in blocks:
         entries.extend(_block_to_md(b, depth=0))
@@ -607,8 +608,8 @@ def fetch_page_blocks_as_text(page_id):
             result_parts.append(md_line)
             continue
         prev_type = entries[i - 1][0]
-        both_list = prev_type in LIST_TYPES and btype in LIST_TYPES
-        if both_list:
+        both_compact = prev_type in COMPACT_TYPES and btype in COMPACT_TYPES
+        if both_compact:
             result_parts.append("\n" + md_line)
         else:
             result_parts.append("\n\n" + md_line)
