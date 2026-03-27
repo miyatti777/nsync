@@ -242,11 +242,15 @@ cd projects/my-project
 ```
 
 - `notion_id` がない → 新規ページとして作成（`notion_parent` に基づく）
+- `notion_parent` もない → **ディレクトリ構造から親ページを自動推定**
+- ファイル名から自動でタイトルを設定（front matter 不要）
 - 作成後、`notion_id` が自動的に front matter に書き込まれる
 - 同名ページが既に Notion にある場合は警告してスキップ
 - `--recursive` で子ページリンク先も再帰的に作成
 
 ### Front Matter
+
+`nsync new` で生成される front matter:
 
 ```yaml
 ---
@@ -260,6 +264,21 @@ title: 企画書
 | `notion_parent` | 親ページの Notion ID（新規作成時に必要） |
 | `title` | ページタイトル（新規作成時に必要） |
 | `notion_id` | Notion ページ ID（作成後に自動設定） |
+
+### Front Matter なしで Push
+
+ワークスペース内のファイルであれば、front matter がなくてもそのまま Push できます:
+
+```bash
+# 人間が普通に作ったファイル（front matter なし）
+echo "## 議事録 2026-03-27\n\n- 議題A\n- 議題B" > "Meeting Notes/議事録.md"
+
+# そのまま Push → ディレクトリから親を自動推定、ファイル名をタイトルに
+./nsync.sh push "Meeting Notes/議事録.md"
+# → 親: Meeting Notes ページ、タイトル: 議事録
+```
+
+Push後、`notion_id` が自動的に front matter に書き込まれます。
 
 ## 子ページリンク
 
