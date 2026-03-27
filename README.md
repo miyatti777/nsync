@@ -99,6 +99,7 @@ cd projects/my-project
 | `sync --full` | Yes | `--refresh` + `--force`（完全再同期） |
 | `sync --dry-run` | Yes | 変更検出のみ（ダウンロードしない） |
 | `pull <file>` | Yes | 特定ページ/DBを再取得（.md/.db 対応） |
+| `pull -r <url>` | Yes | Notion URLのサブツリーを再帰的にPull |
 | `pull --dry-run <file>` | Yes | Notion側の内容プレビュー |
 | `push <file>` | Yes | ローカルファイルをNotion反映（.md/.db 対応） |
 | `push --dry-run <file>` | Yes | Push内容のプレビュー |
@@ -213,6 +214,25 @@ SELECT Name, substr(_body, 1, 200) FROM data WHERE _body LIKE '%Sprint%'
 ```
 
 `sync` が全ページの差分同期なのに対し、`pull` は指定した1ファイルだけを即座に更新します。
+
+### Pull Recursive (サブツリー取得)
+
+Notion URL を指定して、そのページ配下だけを再帰的にクロール＆ダウンロード:
+
+```bash
+# サブツリーだけ取得（sync --refresh よりも高速）
+./nsync.sh pull -r "https://www.notion.so/xxxxx/Page-Name-xxxxx"
+
+# プレビュー（ダウンロードしない）
+./nsync.sh pull -r --dry-run "https://www.notion.so/xxxxx/Page-Name-xxxxx"
+```
+
+`sync --refresh` がルート全体を再クロールするのに対し、`pull -r` は**指定ページ以下だけ**を処理します。
+Notion側でページを移動してきた場合や、特定セクションだけ更新したい場合に便利です。
+
+- サブツリーをクロール → 既存 `tree_cache.json` にマージ
+- ページと DB の両方をダウンロード
+- `sync_state` も更新（次回 `sync` で二重ダウンロードされない）
 
 ### DB Push (SQLite → Notion)
 

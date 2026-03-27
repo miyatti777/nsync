@@ -76,6 +76,7 @@ cd <output_dir>
 | `sync --full` | Yes | `--refresh` + `--force`（完全再同期） |
 | `sync --dry-run` | Yes | 変更検出のみ（ダウンロードしない） |
 | `pull <file>` | Yes | 特定ページ/DBをNotionから再取得（.md/.db対応） |
+| `pull -r <url>` | Yes | Notion URLのサブツリーを再帰的にPull |
 | `pull --dry-run <file>` | Yes | Notion側の内容プレビュー |
 | `push <file>` | Yes | ローカルファイルをNotionに反映（.md/.db対応） |
 | `push --dry-run <file>` | Yes* | Push内容のプレビュー（*md は API不要） |
@@ -133,6 +134,21 @@ Notion のインライン装飾を正しくMarkdownに変換:
 
 `sync` が全ページの差分同期なのに対し、`pull` は指定した1ファイルだけを即座に更新する。
 `push` と対になるコマンド。
+
+## Pull Recursive (subtree)
+
+Notion URL を指定して、そのページ配下のサブツリーだけを再帰的にクロール＆ダウンロードする。
+`sync --refresh` がルート全体を再クロールするのに対し、`pull -r` は**対象ページ以下だけ**を処理するため高速。
+
+```bash
+./nsync.sh pull -r "https://www.notion.so/xxxxx/Page-Name-xxxxx"    # 実行
+./nsync.sh pull -r --dry-run "https://www.notion.so/xxxxx/Page-Name-xxxxx"  # プレビュー
+```
+
+- サブツリーをクロールし、既存の tree_cache.json にマージ（新規追加+既存更新）
+- ページとDBの両方をダウンロード
+- sync_state も更新されるので、次回 `sync` で二重ダウンロードされない
+- Notion側でページを移動してきた場合に特に有効
 
 ## Push Quality (Markdown → Notion)
 

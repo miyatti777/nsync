@@ -1367,6 +1367,111 @@ def _cmd_push_db(db_path, dry_run=False):
     return errors == 0
 
 
+def cmd_pull_recursive(notion_url, dry_run=False):
+    """Recursively pull a subtree from Notion by URL or page ID."""
+    page_id = extract_page_id_from_url(notion_url) if "notion.so" in notion_url else notion_url
+    if not page_id:
+        print("ERROR: Could not extract page ID from: %s" % notion_url, flush=True)
+        return False
+
+    title = _fetch_page_title(page_id)
+    if not title:
+        print("ERROR: Could not fetch page title for %s (check token/permissions)" % page_id, flush=True)
+        return False
+
+    print("=== Recursive Pull [%s] ===" % title, flush=True)
+    print("Page ID: %s" % page_id, flush=True)
+
+    parent_path = ""
+    if CFG.tree_json.exists():
+        with open(CFG.tree_json) as f:
+            existing_tree = json.load(f)
+        for item in existing_tree:
+            if item["id"] == page_id:
+                parent_path = item.get("path", "")
+                break
+
+    if not parent_path:
+        parent_path = title
+
+    print("Crawling subtree...", flush=True)
+    sub_items = deep_crawl(page_id, parent_path, depth=0)
+
+    root_item = {
+        "type": "page", "title": title, "path": parent_path,
+        "id": page_id, "depth": 0, "has_children": True, "is_root": False
+    }
+    all_items = [root_item] + sub_items
+
+    pages = [i for i in all_items if i["type"] == "page"]
+    dbs = [i for i in all_items if i["type"] == "db"]
+    print("Found: %d pages, %d databases" % (len(pages), len(dbs)), flush=True)
+
+    if CFG.tree_json.exists():
+        with open(CFG.tree_json) as f:
+            existing_tree = json.load(f)
+        existing_ids = {i["id"] for i in existing_tree}
+        new_count = 0
+        for item in all_items:
+            if item["id"] not in existing_ids:
+                existing_tree.append(item)
+                new_count += 1
+            else:
+                for i, ex in enumerate(existing_tree):
+                    if ex["id"] == item["id"]:
+                        existing_tree[i] = item
+                        break
+        with open(CFG.tree_json, "w") as f:
+            json.dump(existing_tree, f, ensure_ascii=False, indent=1)
+        print("Tree cache updated (+%d new, %d total)" % (new_count, len(existing_tree)), flush=True)
+    else:
+        with open(CFG.tree_json, "w") as f:
+            json.dump(all_items, f, ensure_ascii=False, indent=1)
+        print("Tree cache created (%d items)" % len(all_items), flush=True)
+
+    if dry_run:
+        print("\nWould download %d items:" % len(all_items), flush=True)
+        for item in all_items[:20]:
+            print("  [%s] %s" % (item["type"], item["title"][:60]), flush=True)
+        if len(all_items) > 20:
+            print("  ... and %d more" % (len(all_items) - 20), flush=True)
+        print("\n(dry-run: no files downloaded)", flush=True)
+        return True
+
+    state = load_sync_state()
+    success = 0
+    errors = 0
+    print("\nDownloading %d items..." % len(all_items), flush=True)
+    for idx, item in enumerate(all_items):
+        try:
+            ok = download_item(item)
+            if ok:
+                success += 1
+                state["items"][item["id"]] = {
+                    "type": item["type"],
+                    "title": item["title"],
+                    "path": item["path"],
+                    "last_edited_time": get_page_last_edited(item["id"]) if item["type"] == "page" else "",
+                    "synced_at": datetime.now().isoformat()
+                }
+            print("  [%d/%d] %s: %s" % (
+                idx + 1, len(all_items),
+                "OK" if ok else "SKIP",
+                item["title"][:50]
+            ), flush=True)
+        except Exception as e:
+            errors += 1
+            print("  [%d/%d] ERROR: %s (%s)" % (idx + 1, len(all_items), item["title"][:40], e), flush=True)
+        time.sleep(CFG.rate_limit_delay)
+
+    state["last_sync"] = datetime.now().isoformat()
+    save_sync_state(state)
+
+    print("\n=== Recursive Pull Complete ===", flush=True)
+    print("Success: %d, Errors: %d" % (success, errors), flush=True)
+    return errors == 0
+
+
 def cmd_push(filepath, dry_run=False):
     p = Path(filepath)
     if not p.exists():
@@ -1989,11 +2094,15 @@ def main():
         cmd_sync(force=True, refresh=True)
     elif command == "pull":
         dry_run = "--dry-run" in args
-        pull_args = [a for a in args[1:] if a != "--dry-run"]
+        recursive = "--recursive" in args or "-r" in args
+        pull_args = [a for a in args[1:] if a not in ("--dry-run", "--recursive", "-r")]
         if len(pull_args) < 1:
-            print("Usage: nsync.py pull [--dry-run] <filepath.md>", flush=True)
+            print("Usage: nsync.py pull [--dry-run] [--recursive|-r] <filepath.md|notion-url>", flush=True)
             sys.exit(1)
-        cmd_pull(pull_args[0], dry_run=dry_run)
+        if recursive:
+            cmd_pull_recursive(pull_args[0], dry_run=dry_run)
+        else:
+            cmd_pull(pull_args[0], dry_run=dry_run)
     elif command == "push":
         dry_run = "--dry-run" in args
         push_args = [a for a in args[1:] if a != "--dry-run"]
@@ -2027,6 +2136,7 @@ def print_usage():
     print("  sync --full         Refresh + force (complete re-sync)", flush=True)
     print("  sync --dry-run     Show what would be synced", flush=True)
     print("  pull <file>        Pull single file from Notion (.md or .db)", flush=True)
+    print("  pull -r <url>      Recursively pull a subtree by Notion URL", flush=True)
     print("  push <file>        Push local file to Notion (.md or .db)", flush=True)
     print("  status             Show sync status", flush=True)
     print("  init-state         Init state from existing files", flush=True)
