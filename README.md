@@ -201,6 +201,16 @@ SELECT Name, substr(_body, 1, 200) FROM data WHERE _body LIKE '%Sprint%'
 
 デフォルトは `true`。大量レコードの DB で無効にしたい場合は `db_page_content: false` を設定してください。
 
+### マルチデータソースDB
+
+Notion の「マルチデータソースDB」（複数のデータベースを統合したビュー）にも自動対応しています。
+
+- 通常の API (v2022-06-28) でクエリ失敗時に自動検出
+- v2025-09-03 の `data_sources` API にフォールバックして全子データソースを取得
+- `_data_source` 列でデータソース元を区別可能
+- `_metadata` テーブルに `multi_data_source: true` が記録される
+- 設定変更は不要（自動フォールバック）
+
 ### Pull (単一ファイル取得)
 
 特定のページまたは DB を Notion から再取得:
