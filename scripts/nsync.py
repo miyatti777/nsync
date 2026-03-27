@@ -567,6 +567,18 @@ def _block_to_md(b, depth=0):
     elif btype == "table":
         table_lines = fetch_table_as_markdown(b["id"])
         md_line = "\n".join(table_lines)
+    elif btype == "paragraph" and plain.startswith("▸ ") and rt and len(rt) >= 2 and rt[1].get("annotations", {}).get("bold"):
+        # Styled H5: ▸ **Title** → ##### Title
+        h5_text = rich_text_to_markdown(rt[1:])
+        if h5_text.startswith("**") and h5_text.endswith("**"):
+            h5_text = h5_text[2:-2]
+        md_line = "##### " + h5_text
+    elif btype == "paragraph" and plain.startswith("▹ ") and rt and len(rt) >= 2 and rt[1].get("annotations", {}).get("bold"):
+        # Styled H6: ▹ **Title** → ###### Title
+        h6_text = rich_text_to_markdown(rt[1:])
+        if h6_text.startswith("**") and h6_text.endswith("**"):
+            h6_text = h6_text[2:-2]
+        md_line = "###### " + h6_text
     elif text:
         md_line = indent + text if depth > 0 else text
 
@@ -1248,11 +1260,25 @@ def markdown_to_notion_blocks(md_text):
                 "object": "block", "type": "code",
                 "code": {"rich_text": rt, "language": lang}
             })
-        elif line.startswith("###### ") or line.startswith("##### ") or line.startswith("#### "):
-            # H4/H5/H6 → heading_4 (Notion maps H5/H6 to H4)
-            htext = line.lstrip("#").lstrip()
+        elif line.startswith("###### "):
+            # H6 → styled paragraph (▹ bold)
+            htext = line[7:]
+            blocks.append({"object": "block", "type": "paragraph",
+                "paragraph": {"rich_text": [
+                    {"type": "text", "text": {"content": "▹ "}},
+                    {"type": "text", "text": {"content": htext}, "annotations": {"bold": True}},
+                ]}})
+        elif line.startswith("##### "):
+            # H5 → styled paragraph (▸ bold)
+            htext = line[6:]
+            blocks.append({"object": "block", "type": "paragraph",
+                "paragraph": {"rich_text": [
+                    {"type": "text", "text": {"content": "▸ "}},
+                    {"type": "text", "text": {"content": htext}, "annotations": {"bold": True}},
+                ]}})
+        elif line.startswith("#### "):
             blocks.append({"object": "block", "type": "heading_4",
-                "heading_4": {"rich_text": parse_inline_markdown(htext)}})
+                "heading_4": {"rich_text": parse_inline_markdown(line[5:])}})
         elif line.startswith("### "):
             blocks.append({"object": "block", "type": "heading_3",
                 "heading_3": {"rich_text": parse_inline_markdown(line[4:])}})
