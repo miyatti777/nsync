@@ -2509,6 +2509,72 @@ def _append_blocks(page_id, blocks, after_id=None):
     return last_id
 
 
+_MEDIA_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".tiff", ".bmp", ".heic",
+    ".pdf",
+    ".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp", ".wmv", ".flv",
+    ".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4a", ".wma",
+}
+
+_EXT_TO_BLOCK_TYPE = {
+    ".png": "image", ".jpg": "image", ".jpeg": "image", ".gif": "image",
+    ".webp": "image", ".svg": "image", ".tiff": "image", ".bmp": "image", ".heic": "image",
+    ".pdf": "pdf",
+    ".mp4": "video", ".mov": "video", ".avi": "video", ".mkv": "video", ".webm": "video",
+    ".mp3": "audio", ".wav": "audio", ".ogg": "audio", ".flac": "audio", ".aac": "audio",
+}
+
+_BLOCK_TYPE_ICON = {"image": "", "pdf": "📎", "video": "🎬", "audio": "🔊", "file": "📁"}
+
+
+def _find_standalone_media(page_dir, md_text):
+    """Find media files in page_dir (and _assets/) not referenced in md_text.
+    Returns list of Path objects."""
+    standalone = []
+    for f in sorted(page_dir.iterdir()):
+        if f.is_dir() and f.name == "_assets":
+            for af in sorted(f.iterdir()):
+                if af.suffix.lower() in _MEDIA_EXTENSIONS:
+                    rel = "_assets/" + af.name
+                    if rel not in md_text and af.name not in md_text:
+                        standalone.append(af)
+        elif f.is_file() and f.suffix.lower() in _MEDIA_EXTENSIONS:
+            if f.name not in md_text:
+                standalone.append(f)
+    return standalone
+
+
+def _create_media_page_md(media_file, parent_notion_id, page_dir):
+    """Create a .md file for a standalone media file. Returns the created .md Path."""
+    stem = media_file.stem
+    ext = media_file.suffix.lower()
+    btype = _EXT_TO_BLOCK_TYPE.get(ext, "file")
+
+    md_dir = page_dir / stem
+    md_dir.mkdir(parents=True, exist_ok=True)
+    md_path = md_dir / (stem + ".md")
+
+    assets_dir = md_dir / "_assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    import shutil
+    dest_asset = assets_dir / media_file.name
+    if not dest_asset.exists():
+        shutil.copy2(str(media_file), str(dest_asset))
+
+    rel_asset = "_assets/" + media_file.name
+    if btype == "image":
+        content_line = "![%s](%s)" % (stem, rel_asset)
+    else:
+        icon = _BLOCK_TYPE_ICON.get(btype, "📁")
+        content_line = "[%s %s](%s)" % (icon, stem, rel_asset)
+
+    fm = "---\nnotion_parent: %s\ntitle: %s\n---\n\n%s\n" % (
+        parent_notion_id, stem, content_line
+    )
+    md_path.write_text(fm, encoding="utf-8")
+    return md_path
+
+
 def _resolve_local_uploads(blocks, page_dir, dry_run=False):
     """Resolve _local_upload blocks by uploading files to Notion.
     Returns blocks with uploads replaced by proper Notion blocks."""
@@ -2767,6 +2833,38 @@ def cmd_push(filepath, dry_run=False, recursive=False):
         if new_children:
             print("  Created %d child pages: %s" % (len(new_children), ", ".join(new_children)), flush=True)
 
+    # Standalone media files: create pages and push
+    standalone = _find_standalone_media(p.parent, body)
+    if standalone:
+        print("  Standalone media files: %d" % len(standalone), flush=True)
+        for mf in standalone:
+            print("  Creating page for: %s" % mf.name, flush=True)
+            if dry_run:
+                print("    (dry-run: would create page '%s')" % mf.stem, flush=True)
+                continue
+            md_path = _create_media_page_md(mf, notion_id, p.parent)
+            cmd_push_new(str(md_path), dry_run=False, recursive=False)
+
+            # Add child link to parent MD
+            ext = mf.suffix.lower()
+            btype = _EXT_TO_BLOCK_TYPE.get(ext, "file")
+            if btype == "image":
+                link_line = "[📄 %s](%s/%s.md)" % (mf.stem, mf.stem, mf.stem)
+            else:
+                link_line = "[📄 %s](%s/%s.md)" % (mf.stem, mf.stem, mf.stem)
+            body_with_link = body.rstrip() + "\n" + link_line
+            fm_lines = ["---"]
+            for k, v in fm.items():
+                fm_lines.append("%s: %s" % (k, v))
+            fm_lines.append("---")
+            p.write_text("\n".join(fm_lines) + "\n\n" + body_with_link, encoding="utf-8")
+            body = body_with_link
+
+            # Remove original standalone file (now moved to child page _assets/)
+            if mf.exists() and (p.parent / mf.stem / "_assets" / mf.name).exists():
+                mf.unlink()
+                print("    Moved to %s/_assets/%s" % (mf.stem, mf.name), flush=True)
+
     return True
 
 
@@ -2917,6 +3015,76 @@ def _auto_push_local_changes(local_changes, remote_changed_ids, dry_run=False):
     return pushed, conflicts
 
 
+def _detect_renames(tree, state):
+    """Detect pages renamed on Notion and move local files accordingly.
+    Returns count of renames performed."""
+    renames = 0
+    _mark_containers(tree)
+    for item in tree:
+        item_id = item["id"]
+        if item_id not in state.get("items", {}):
+            continue
+        old_path = state["items"][item_id].get("path", "")
+        new_path = item.get("path", "")
+        if not old_path or not new_path or old_path == new_path:
+            continue
+
+        old_item = dict(item)
+        old_item["path"] = old_path
+        old_filepath = item_to_filepath(old_item)
+        new_filepath = item_to_filepath(item)
+
+        if not old_filepath or not new_filepath:
+            continue
+        if not old_filepath.exists():
+            continue
+        if old_filepath == new_filepath:
+            continue
+
+        new_filepath.parent.mkdir(parents=True, exist_ok=True)
+        import shutil
+
+        if item.get("is_container") or item.get("is_root"):
+            old_dir = old_filepath.parent
+            new_dir = new_filepath.parent
+            if old_dir.is_dir() and old_dir != new_dir:
+                shutil.move(str(old_dir), str(new_dir))
+                print("  Renamed dir: %s → %s" % (
+                    old_dir.relative_to(CFG.base_output_dir),
+                    new_dir.relative_to(CFG.base_output_dir)), flush=True)
+                # The .md file inside also needs renaming
+                old_md_in_new_dir = new_dir / old_filepath.name
+                if old_md_in_new_dir.exists() and old_md_in_new_dir != new_filepath:
+                    shutil.move(str(old_md_in_new_dir), str(new_filepath))
+        else:
+            shutil.move(str(old_filepath), str(new_filepath))
+            print("  Renamed: %s → %s" % (
+                old_filepath.relative_to(CFG.base_output_dir),
+                new_filepath.relative_to(CFG.base_output_dir)), flush=True)
+
+        # Update front matter notion_path in the moved file
+        if new_filepath.exists() and new_filepath.suffix == ".md":
+            try:
+                txt = new_filepath.read_text(encoding="utf-8")
+                if "notion_path:" in txt:
+                    txt = re.sub(
+                        r'(notion_path:\s*).*',
+                        r'\g<1>' + new_path,
+                        txt, count=1
+                    )
+                    new_filepath.write_text(txt, encoding="utf-8")
+            except Exception:
+                pass
+
+        state["items"][item_id]["path"] = new_path
+        state["items"][item_id]["title"] = item.get("title", "")
+        if new_filepath.exists():
+            state["items"][item_id]["content_hash"] = _file_content_hash(new_filepath)
+        renames += 1
+
+    return renames
+
+
 def cmd_sync(force=False, dry_run=False, refresh=False, no_push=False):
     if refresh or not CFG.tree_json.exists():
         if not CFG.tree_json.exists():
@@ -2928,6 +3096,12 @@ def cmd_sync(force=False, dry_run=False, refresh=False, no_push=False):
 
     state = load_sync_state()
     now = datetime.now().isoformat()
+
+    # Phase 0: Detect renames (Notion page title changes → move local files)
+    rename_count = _detect_renames(tree, state)
+    if rename_count > 0:
+        print("Renames detected: %d" % rename_count, flush=True)
+        save_sync_state(state)
 
     # Phase 1: Detect local changes (fast, local-only)
     local_changes = [] if no_push else _detect_local_changes(state)
