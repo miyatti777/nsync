@@ -6,7 +6,7 @@
 
 ## 特徴
 
-- **Sync**: Notionページ配下をローカルにMarkdownとして差分同期（`last_edited_time` 比較）
+- **Bidirectional Sync**: ローカル変更を自動検出→Push後、Notion側の変更をPull（コンテンツハッシュで正確な差分検出）
 - **Pull / Push**: 特定ページの個別取得・反映（インライン装飾対応）
 - **Refresh**: Notionのページツリーを最新化してから同期（新規・削除ページの検出）
 - **DB → SQLite**: NotionデータベースをSQLiteファイルに変換し、SQLクエリ可能
@@ -93,11 +93,12 @@ cd projects/my-project
 | コマンド | API必要 | 説明 |
 |---------|---------|------|
 | `init <url> [dir]` | Yes | 新規ワークスペース作成 |
-| `sync` | Yes | 差分同期（デフォルト、初回はツリー取得も自動） |
-| `sync --refresh` | Yes | ページ一覧を最新化してから差分同期 |
+| `sync` | Yes | 双方向同期（ローカル変更Push→リモート変更Pull） |
+| `sync --refresh` | Yes | ページ一覧を最新化してから同期 |
 | `sync --force` | Yes | 全ページ強制再ダウンロード |
 | `sync --full` | Yes | `--refresh` + `--force`（完全再同期） |
 | `sync --dry-run` | Yes | 変更検出のみ（ダウンロードしない） |
+| `sync --no-push` | Yes | ローカル変更の自動Pushをスキップ |
 | `pull <file>` | Yes | 特定ページ/DBを再取得（.md/.db 対応） |
 | `pull -r <url>` | Yes | Notion URLのサブツリーを再帰的にPull |
 | `pull --dry-run <file>` | Yes | Notion側の内容プレビュー |
@@ -294,6 +295,29 @@ nsync はクロール中に50件ごとにチェックポイントを `_sync/craw
 ```
 
 `crawl_max_depth` を変更した場合、不要なキュー項目は自動的にスキップされます。
+
+## 双方向同期
+
+`sync` コマンドはデフォルトで双方向同期を行います:
+
+1. **ローカル変更検出** — SHA256ハッシュで実際の内容変更のみを検出（mtime偽陽性を排除）
+2. **自動Push** — ローカルで編集されたファイルを Notion に反映
+3. **競合検出** — 同じファイルがローカル・Notion 双方で変更されている場合はスキップ＆警告
+4. **リモート変更Pull** — Notion 側の変更をダウンロード
+
+```bash
+# 通常の双方向同期
+./nsync.sh sync
+
+# ローカル変更Pushをスキップ（Notion→ローカルのみ）
+./nsync.sh sync --no-push
+```
+
+ローカル変更検出はファイルシステムのみの操作（API呼び出しなし）で、数百ファイルでも数百ミリ秒で完了します。
+
+競合（CONFLICT）が検出された場合は手動で解決してください:
+- `push <file>` でローカル版を優先
+- `pull <file>` で Notion 版を優先
 
 ## Rate Limit ハンドリング
 

@@ -11,6 +11,7 @@ nsync — Generic Notion Sync Tool
 __version__ = "0.1.0"
 
 import atexit
+import hashlib
 import json
 import os
 import re
@@ -955,6 +956,18 @@ def save_sync_state(state):
         json.dump(state, f, indent=2, ensure_ascii=False)
 
 
+def _file_content_hash(filepath):
+    """Compute SHA256 hash of file content. Returns hex string or empty on error."""
+    try:
+        h = hashlib.sha256()
+        with open(filepath, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return ""
+
+
 def get_page_last_edited(page_id):
     url = "https://api.notion.com/v1/pages/%s" % page_id
     data = api_get(url)
@@ -1527,13 +1540,17 @@ def cmd_pull_recursive(notion_url, dry_run=False):
             ok = download_item(item)
             if ok:
                 success += 1
-                state["items"][item["id"]] = {
+                entry = {
                     "type": item["type"],
                     "title": item["title"],
                     "path": item["path"],
                     "last_edited_time": get_page_last_edited(item["id"]) if item["type"] == "page" else "",
                     "synced_at": datetime.now().isoformat()
                 }
+                fp = item_to_filepath(item)
+                if fp and fp.exists():
+                    entry["content_hash"] = _file_content_hash(fp)
+                state["items"][item["id"]] = entry
             print("  [%d/%d] %s: %s" % (
                 idx + 1, len(all_items),
                 "OK" if ok else "SKIP",
@@ -1624,6 +1641,14 @@ def cmd_push(filepath, dry_run=False):
     fm_lines.append("---")
     p.write_text("\n".join(fm_lines) + "\n\n" + body, encoding="utf-8")
 
+    # Update sync state with new content hash
+    state = load_sync_state()
+    if notion_id in state.get("items", {}):
+        state["items"][notion_id]["synced_at"] = now
+        state["items"][notion_id]["pushed_at"] = now
+        state["items"][notion_id]["content_hash"] = _file_content_hash(p)
+        save_sync_state(state)
+
     print("Push complete.", flush=True)
     return True
 
@@ -1683,7 +1708,99 @@ def cmd_crawl():
     return items
 
 
-def cmd_sync(force=False, dry_run=False, refresh=False):
+def _detect_local_changes(state):
+    """Detect locally modified files using content hash comparison.
+
+    Uses SHA256 hash stored at sync time. Falls back to mtime with a
+    generous threshold (300s) for entries without a stored hash.
+    Returns list of (item_id, filepath, state_entry) for files changed locally.
+    """
+    changed = []
+    for item_id, entry in state.get("items", {}).items():
+        synced_at = entry.get("synced_at", "")
+        if not synced_at:
+            continue
+        item_type = entry.get("type", "page")
+        if item_type != "page":
+            continue
+
+        filepath = None
+        item_path = entry.get("path", "")
+        if item_path:
+            parts = item_path.split("/")
+            sanitized = [sanitize_filename(p) for p in parts]
+            fname = sanitized[-1]
+            if not fname.endswith(".md"):
+                fname += ".md"
+            if len(sanitized) > 1:
+                filepath = CFG.base_output_dir / os.path.join(*sanitized[:-1]) / fname
+            else:
+                filepath = CFG.base_output_dir / fname
+            container_path = CFG.base_output_dir / os.path.join(*sanitized) / fname
+            if container_path.exists():
+                filepath = container_path
+
+        if not filepath or not filepath.exists():
+            continue
+
+        stored_hash = entry.get("content_hash", "")
+        if stored_hash:
+            current_hash = _file_content_hash(filepath)
+            if current_hash and current_hash != stored_hash:
+                changed.append((item_id, filepath, entry))
+        else:
+            # Fallback for old entries without hash: mtime with 5min threshold
+            try:
+                mtime = os.path.getmtime(filepath)
+                synced_ts = datetime.fromisoformat(synced_at).timestamp()
+                if mtime - synced_ts > 300:
+                    changed.append((item_id, filepath, entry))
+            except (OSError, ValueError):
+                continue
+    return changed
+
+
+def _auto_push_local_changes(local_changes, remote_changed_ids, dry_run=False):
+    """Push locally modified files to Notion. Skip conflicts (both modified).
+
+    Returns (pushed_count, conflict_ids).
+    """
+    pushed = 0
+    conflicts = set()
+
+    if not local_changes:
+        return pushed, conflicts
+
+    print("--- Local Changes Detected ---", flush=True)
+    print("Found %d locally modified file(s)" % len(local_changes), flush=True)
+
+    for item_id, filepath, entry in local_changes:
+        title = entry.get("title", filepath.name)[:60]
+
+        if item_id in remote_changed_ids:
+            conflicts.add(item_id)
+            print("  CONFLICT: %s (both local & remote changed, skipping)" % title, flush=True)
+            continue
+
+        if dry_run:
+            print("  PUSH (dry): %s" % title, flush=True)
+            continue
+
+        print("  PUSH: %s" % title, flush=True)
+        ok = cmd_push(str(filepath), dry_run=False)
+        if ok:
+            pushed += 1
+        else:
+            print("  WARN: Push failed for %s" % title, flush=True)
+
+    print("Pushed: %d, Conflicts: %d" % (pushed, len(conflicts)), flush=True)
+    if conflicts:
+        print("(Conflicting files left untouched. Resolve manually, then push/pull.)", flush=True)
+    print(flush=True)
+    return pushed, conflicts
+
+
+def cmd_sync(force=False, dry_run=False, refresh=False, no_push=False):
     if refresh or not CFG.tree_json.exists():
         if not CFG.tree_json.exists():
             print("No tree cache found. Running refresh...", flush=True)
@@ -1695,17 +1812,23 @@ def cmd_sync(force=False, dry_run=False, refresh=False):
     state = load_sync_state()
     now = datetime.now().isoformat()
 
+    # Phase 1: Detect local changes (fast, local-only)
+    local_changes = [] if no_push else _detect_local_changes(state)
+
     new_items = []
     updated_items = []
     unchanged = 0
     errors = 0
 
-    print("=== Differential Sync [%s] ===" % CFG.label, flush=True)
+    print("=== Bidirectional Sync [%s] ===" % CFG.label, flush=True)
     print("Started: " + now, flush=True)
     print("Total items: %d" % len(tree), flush=True)
-    print("Checking for changes...", flush=True)
+    if local_changes:
+        print("Local modifications: %d" % len(local_changes), flush=True)
+    print("Checking remote changes...", flush=True)
     print(flush=True)
 
+    # Phase 2: Check remote changes
     for idx, item in enumerate(tree):
         item_id = item["id"]
 
@@ -1733,11 +1856,27 @@ def cmd_sync(force=False, dry_run=False, refresh=False):
             print("  ... checked %d/%d" % (idx + 1, len(tree)), flush=True)
 
     print(flush=True)
-    print("New: %d, Updated: %d, Unchanged: %d" % (len(new_items), len(updated_items), unchanged), flush=True)
 
+    # Phase 3: Push local changes before downloading remote
+    remote_changed_ids = set(i["id"] for i in updated_items)
+    if local_changes:
+        pushed_count, conflict_ids = _auto_push_local_changes(
+            local_changes, remote_changed_ids, dry_run=dry_run
+        )
+        # Remove conflict items from download list
+        if conflict_ids:
+            updated_items = [i for i in updated_items if i["id"] not in conflict_ids]
+    else:
+        conflict_ids = set()
+
+    print("New: %d, Updated: %d, Unchanged: %d" % (len(new_items), len(updated_items), unchanged), flush=True)
+    if conflict_ids:
+        print("Conflicts (skipped): %d" % len(conflict_ids), flush=True)
+
+    # Phase 4: Download remote changes
     to_download = new_items + updated_items
     if not to_download:
-        print("Nothing to sync.", flush=True)
+        print("Nothing to sync from Notion.", flush=True)
         return
 
     if dry_run:
@@ -1776,11 +1915,15 @@ def cmd_sync(force=False, dry_run=False, refresh=False):
             remote_edited = get_page_last_edited(item["id"])
             time.sleep(CFG.rate_limit_delay)
 
-        state["items"][item["id"]] = {
+        entry = {
             "title": item["title"], "path": item["path"],
             "type": item["type"], "last_edited_time": remote_edited,
             "synced_at": datetime.now().isoformat(),
         }
+        fp = item_to_filepath(item)
+        if fp and fp.exists():
+            entry["content_hash"] = _file_content_hash(fp)
+        state["items"][item["id"]] = entry
         save_sync_state(state)
         time.sleep(CFG.rate_limit_delay)
 
@@ -1791,6 +1934,8 @@ def cmd_sync(force=False, dry_run=False, refresh=False):
     print("=== Sync Complete ===", flush=True)
     print("Success: %d, Errors: %d (New: %d, Updated: %d)" % (
         success, errors, len(new_items), len(updated_items)), flush=True)
+    if conflict_ids:
+        print("Conflicts: %d (resolve manually)" % len(conflict_ids), flush=True)
     print("Finished: " + datetime.now().isoformat(), flush=True)
 
 
@@ -1815,11 +1960,14 @@ def cmd_init_state():
             is_present = db_filepath(item["title"], item.get("path", "")).exists()
 
         if is_present:
-            state["items"][item["id"]] = {
+            entry = {
                 "title": item["title"], "path": item["path"],
                 "type": item["type"], "last_edited_time": "",
                 "synced_at": datetime.now().isoformat(),
             }
+            if filepath and filepath.exists():
+                entry["content_hash"] = _file_content_hash(filepath)
+            state["items"][item["id"]] = entry
             found += 1
         else:
             missing += 1
@@ -2162,10 +2310,11 @@ def main():
         dry_run = "--dry-run" in args
         refresh = "--refresh" in args
         full = "--full" in args
+        no_push = "--no-push" in args
         if full:
             refresh = True
             force = True
-        cmd_sync(force=force, dry_run=dry_run, refresh=refresh)
+        cmd_sync(force=force, dry_run=dry_run, refresh=refresh, no_push=no_push)
     elif command == "init-state":
         cmd_init_state()
     elif command == "status":
@@ -2210,11 +2359,12 @@ def print_usage():
     print("  nsync.py --config <.nsync.yaml> <command>  Run with config", flush=True)
     print("", flush=True)
     print("Commands:", flush=True)
-    print("  sync               Differential sync (default)", flush=True)
+    print("  sync               Bidirectional sync (push local changes, pull remote)", flush=True)
     print("  sync --refresh     Refresh page list, then sync", flush=True)
     print("  sync --force       Force re-download all pages", flush=True)
     print("  sync --full         Refresh + force (complete re-sync)", flush=True)
     print("  sync --dry-run     Show what would be synced", flush=True)
+    print("  sync --no-push     Skip local change detection & auto-push", flush=True)
     print("  pull <file>        Pull single file from Notion (.md or .db)", flush=True)
     print("  pull -r <url>      Recursively pull a subtree by Notion URL", flush=True)
     print("  push <file>        Push local file to Notion (.md or .db)", flush=True)
