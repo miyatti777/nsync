@@ -2062,6 +2062,79 @@ def cmd_push_new(filepath, dry_run=False, recursive=False):
     return True
 
 
+def _infer_parent_from_path(filepath):
+    """Infer Notion parent page from local file path using tree_cache.
+
+    Walks up the directory hierarchy to find a directory that corresponds to
+    a known Notion page. Returns (parent_notion_id, title) or None.
+    """
+    p = Path(filepath).resolve()
+    base = CFG.base_output_dir.resolve()
+
+    try:
+        p.relative_to(base)
+    except ValueError:
+        return None
+
+    title = p.stem
+
+    tree = _load_tree_cache()
+    if not tree:
+        return None
+
+    # Find root item to determine root prefix in tree paths
+    root_item = None
+    for item in tree:
+        if item.get("is_root"):
+            root_item = item
+            break
+
+    parent_dir = p.parent
+    try:
+        rel_dir = parent_dir.relative_to(base)
+    except ValueError:
+        return None
+
+    # If the file is directly in base dir, parent is root
+    if str(rel_dir) == ".":
+        if root_item:
+            return (root_item["id"], title)
+        return None
+
+    dir_parts = list(rel_dir.parts)
+
+    # Tree paths may include the root page name as prefix (e.g., "Palma/子ページ").
+    # Local paths don't include the root name (base dir IS the root).
+    # So we need to compare with and without root prefix.
+    root_prefix = sanitize_filename(root_item["title"]) if root_item else ""
+
+    # Strategy: match deepest directory first, walk up
+    for depth in range(len(dir_parts), 0, -1):
+        candidate_parts = dir_parts[:depth]
+
+        for item in tree:
+            if item["type"] != "page":
+                continue
+            item_path_parts = item["path"].split("/")
+            item_sanitized = [sanitize_filename(x) for x in item_path_parts]
+
+            # Direct match (tree paths without root prefix)
+            if len(item_sanitized) == depth and item_sanitized == candidate_parts:
+                return (item["id"], title)
+
+            # Match with root prefix stripped (tree path = "Root/A/B", local = "A/B")
+            if (len(item_sanitized) == depth + 1
+                    and item_sanitized[0] == root_prefix
+                    and item_sanitized[1:] == candidate_parts):
+                return (item["id"], title)
+
+    # Fallback: root page
+    if root_item:
+        return (root_item["id"], title)
+
+    return None
+
+
 def _append_blocks(page_id, blocks, after_id=None):
     """Append blocks to a page, optionally after a specific block. Returns last new block ID."""
     if not blocks:
@@ -2098,10 +2171,29 @@ def cmd_push(filepath, dry_run=False, recursive=False):
     notion_id = fm.get("notion_id", "")
 
     if not notion_id:
-        if fm.get("notion_parent") or fm.get("title"):
-            return cmd_push_new(filepath, dry_run=dry_run, recursive=recursive)
-        print("ERROR: No notion_id or notion_parent in front matter of %s" % filepath, flush=True)
-        return False
+        if not fm.get("notion_parent"):
+            # Try to infer parent from directory structure
+            inferred = _infer_parent_from_path(p)
+            if inferred:
+                parent_id, inferred_title = inferred
+                fm["notion_parent"] = parent_id
+                if not fm.get("title"):
+                    fm["title"] = inferred_title
+                # Write inferred front matter back so cmd_push_new can read it
+                fm_lines = ["---"]
+                for k, v in fm.items():
+                    fm_lines.append("%s: %s" % (k, v))
+                fm_lines.append("---")
+                p.write_text("\n".join(fm_lines) + "\n\n" + body, encoding="utf-8")
+                print("Inferred parent: %s (from directory structure)" % parent_id[:8], flush=True)
+            elif not fm.get("title"):
+                print("ERROR: Cannot determine where to create page.", flush=True)
+                print("  Add 'notion_parent' to front matter, or place the file inside", flush=True)
+                print("  an existing nsync workspace directory.", flush=True)
+                return False
+        if not fm.get("title"):
+            fm["title"] = p.stem
+        return cmd_push_new(filepath, dry_run=dry_run, recursive=recursive)
 
     new_blocks = markdown_to_notion_blocks(body)
     has_wikilinks = any(blk.get("_wikilink") for blk in new_blocks)
