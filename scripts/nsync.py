@@ -516,6 +516,8 @@ def _block_to_md(b, depth=0):
         md_line = "## " + text
     elif btype == "heading_3":
         md_line = "### " + text
+    elif btype == "heading_4":
+        md_line = "#### " + text
     elif btype == "bulleted_list_item":
         md_line = indent + "- " + text
     elif btype == "numbered_list_item":
@@ -1246,6 +1248,11 @@ def markdown_to_notion_blocks(md_text):
                 "object": "block", "type": "code",
                 "code": {"rich_text": rt, "language": lang}
             })
+        elif line.startswith("###### ") or line.startswith("##### ") or line.startswith("#### "):
+            # H4/H5/H6 → heading_4 (Notion maps H5/H6 to H4)
+            htext = line.lstrip("#").lstrip()
+            blocks.append({"object": "block", "type": "heading_4",
+                "heading_4": {"rich_text": parse_inline_markdown(htext)}})
         elif line.startswith("### "):
             blocks.append({"object": "block", "type": "heading_3",
                 "heading_3": {"rich_text": parse_inline_markdown(line[4:])}})
