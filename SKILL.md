@@ -9,6 +9,34 @@
 - ローカルで編集したMarkdownをNotionに反映（Push）したいとき
 - NotionのデータベースをSQLiteとしてローカルで参照・クエリしたいとき
 
+## How to Invoke（依頼の仕方）
+
+### Cursor IDE チャットから
+
+自然言語で依頼するだけで、適切なコマンドが実行されます:
+
+| 依頼例 | 実行されるコマンド |
+|--------|-------------------|
+| 「Notion同期して」 | `sync` |
+| 「Notionの最新を取得して」 | `sync --refresh` |
+| 「全ページ再ダウンロードして」 | `sync --force` |
+| 「このファイルをNotionに反映して」 | `push <file>` |
+| 「Product Backlogを検索して」 | `query <db> "SQL..."` |
+| 「Meeting Notesだけ取得して」 | `pull -r <url>` |
+
+### Claude Code / CLI から
+
+```bash
+# 双方向同期
+python3 <skill_dir>/scripts/nsync.py sync
+
+# 特定ページをPush
+python3 <skill_dir>/scripts/nsync.py push path/to/page.md
+
+# DB検索
+python3 <skill_dir>/scripts/nsync.py query backlog "SELECT * FROM data LIMIT 10"
+```
+
 ## Architecture
 
 ```
@@ -227,6 +255,18 @@ SELECT Name, _body FROM data WHERE _body LIKE '%キーワード%'
 Notionの「マルチデータソースDB」（複数DBを統合したビュー）にも自動対応。
 通常のAPI(v2022-06-28)でエラーになった場合、v2025-09-03 の `data_sources` APIにフォールバックして全子データソースを取得・マージする。
 `_data_source` 列でデータソースを区別可能。`_metadata` テーブルに `multi_data_source: true` が記録される。
+
+## Child Page Links
+
+Pull時、子ページ/子DBは相対パスのMarkdownリンクとして出力される。
+VS Code/CursorでCmd+クリックでファイルに直接ジャンプ可能（拡張不要）。
+
+```markdown
+[📄 Page Title](./Page Title/Page Title.md)
+[🗃️ DB Name](./DB_Name.db)
+```
+
+Push時はリンク位置を解析して、Notion側の子ブロック順序を正確に復元（Position-aware Push）。
 
 ## Typical Workflows
 

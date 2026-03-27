@@ -154,6 +154,63 @@ exclude_paths:
 | `db_page_content` | DB各行のページ本文を `_body` カラムに格納 | `true` |
 | `exclude_paths` | 検索から除外するパス | `["_sync", "_archived"]` |
 
+## AI アシスタントからの使い方
+
+### Cursor IDE（Claude Skill として）
+
+Cursorのチャットで自然言語で依頼できます:
+
+```
+「NotionのPalmaページをローカルに同期して」
+→ nsync init + sync を実行
+
+「Notion同期して」「nsync sync」
+→ 双方向同期を実行
+
+「このページをNotionに反映して」
+→ push を実行
+
+「Product Backlogの内容を見せて」
+→ query コマンドでSQLite検索
+
+「Notionの Meeting Notes だけ更新して」
+→ pull -r でサブツリー同期
+```
+
+### Claude Code（ターミナル）
+
+```bash
+# Claude Code のプロンプトから
+claude "nsync で Palma を同期して"
+claude "Product Backlog から優先度高のタスクを検索して"
+```
+
+### CLI（直接実行）
+
+```bash
+cd projects/my-project
+./nsync.sh sync              # 双方向同期
+./nsync.sh push page.md      # ローカル→Notion
+./nsync.sh pull page.md      # Notion→ローカル
+./nsync.sh query backlog "SELECT * FROM data WHERE Status='In Progress'"
+```
+
+## 子ページリンク
+
+Pull時、Notionの子ページ・子データベースはMarkdownの相対リンクとして出力されます:
+
+```markdown
+## 仕様
+
+[📄 1_sense：リサーチ](1_sense：リサーチ/1_sense：リサーチ.md)
+[📄 2_focus：戦略](2_focus：戦略/2_focus：戦略.md)
+[🗃️ Product Backlog](Product_Backlog.db)
+```
+
+- **Cmd+クリック** でファイルに直接ジャンプ（VS Code/Cursor、拡張不要）
+- スペースや括弧を含むパスは `<>` で囲まれ、正しくリンク動作
+- Push時にリンク位置を解析し、Notion側の子ブロック順序を正確に復元
+
 ## 対応ブロックタイプ
 
 ### Pull (Notion → Markdown)
@@ -185,7 +242,7 @@ exclude_paths:
 見出し(H1-H3), リスト, チェックボックス, コードブロック, 引用, 区切り線, 画像, 段落。
 インライン装飾（太字/イタリック/取り消し線/コード/リンク）対応。
 
-`push` は `child_page` / `child_database` ブロックを保護します（削除しない）。
+`push` は `child_page` / `child_database` ブロックを保護し、子リンクの位置情報を使って元の構造を復元します（Position-aware Push）。
 
 ### DB 行のページ本文
 
