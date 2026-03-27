@@ -103,7 +103,9 @@ cd projects/my-project
 | `pull -r <url>` | Yes | Notion URLのサブツリーを再帰的にPull |
 | `pull --dry-run <file>` | Yes | Notion側の内容プレビュー |
 | `push <file>` | Yes | ローカルファイルをNotion反映（.md/.db 対応） |
-| `push --dry-run <file>` | Yes | Push内容のプレビュー |
+| `push -r <file>` | Yes | 再帰Push（子ページも作成・更新） |
+| `push --dry-run <file>` | Yes | Push内容のプレビュー（構造検証付き） |
+| `new <parent> "Title"` | No | 新規ページのローカル構造を生成（scaffold） |
 | `status` | No | 同期状態のサマリー表示 |
 | `init-state` | No | 既存ファイルから同期状態を再構築 |
 | `db-list` | No | SQLiteデータベース一覧 |
@@ -194,6 +196,69 @@ cd projects/my-project
 ./nsync.sh pull page.md      # Notion→ローカル
 ./nsync.sh query backlog "SELECT * FROM data WHERE Status='In Progress'"
 ```
+
+## 新規ページ作成
+
+ローカルでページを作成し、Notionに新規ページとして反映できます。
+
+### 1. Scaffold（ローカル構造の生成）
+
+```bash
+# 子ページなし
+./nsync.sh new "https://www.notion.so/xxx/Parent-xxx" "企画書"
+
+# 子ページ付き
+./nsync.sh new "https://www.notion.so/xxx/Parent-xxx" "企画書" --children "調査メモ,スケジュール,議事録"
+
+# 親をtree_cacheのページ名で指定することも可能
+./nsync.sh new "Palma" "新ページ"
+```
+
+生成される構造:
+```
+企画書/
+├── 企画書.md              ← notion_parent 付き front matter
+├── 調査メモ/
+│   └── 調査メモ.md
+├── スケジュール/
+│   └── スケジュール.md
+└── 議事録/
+    └── 議事録.md
+```
+
+### 2. 編集
+
+生成された `.md` ファイルを自由に編集。子ページリンクは自動的に挿入済み。
+
+### 3. Notion に Push
+
+```bash
+# 親ページと子ページを一括作成
+./nsync.sh push --recursive 企画書/企画書.md
+
+# プレビュー（構造検証付き）
+./nsync.sh push --dry-run --recursive 企画書/企画書.md
+```
+
+- `notion_id` がない → 新規ページとして作成（`notion_parent` に基づく）
+- 作成後、`notion_id` が自動的に front matter に書き込まれる
+- 同名ページが既に Notion にある場合は警告してスキップ
+- `--recursive` で子ページリンク先も再帰的に作成
+
+### Front Matter
+
+```yaml
+---
+notion_parent: 299b1337-01be-8077-807d-f97d164b62b3
+title: 企画書
+---
+```
+
+| Key | 説明 |
+|-----|------|
+| `notion_parent` | 親ページの Notion ID（新規作成時に必要） |
+| `title` | ページタイトル（新規作成時に必要） |
+| `notion_id` | Notion ページ ID（作成後に自動設定） |
 
 ## 子ページリンク
 

@@ -1713,6 +1713,357 @@ def _split_blocks_by_wikilinks(new_blocks, child_blocks):
     return segments
 
 
+# ==========================================
+# New Page Creation & Scaffold
+# ==========================================
+
+_CHILD_LINK_RE_PARSE = re.compile(r'^\[(\U0001f4c4|\U0001f5c3\ufe0f)\s+(.+?)\]\(<?(.+?)>?\)$', re.MULTILINE)
+
+def cmd_new(parent_ref, title, children=None):
+    """Scaffold a new page structure with front matter and child links."""
+    children = children or []
+
+    parent_id = ""
+    if parent_ref.startswith("http"):
+        parent_id = extract_page_id_from_url(parent_ref)
+    else:
+        # Try to find parent in tree_cache by path or title
+        tree = _load_tree_cache()
+        for t_item in tree:
+            if t_item.get("title") == parent_ref or t_item.get("path") == parent_ref:
+                parent_id = t_item["id"]
+                break
+        if not parent_id:
+            # Try as notion_id from a local .md file
+            p = Path(parent_ref)
+            if p.exists() and p.suffix == ".md":
+                text = p.read_text(encoding="utf-8")
+                fm, _ = parse_front_matter(text)
+                parent_id = fm.get("notion_id", "")
+
+    if not parent_id:
+        print("ERROR: Could not resolve parent: %s" % parent_ref, flush=True)
+        print("  Use a Notion URL, page title, tree path, or local .md file.", flush=True)
+        return False
+
+    safe_title = sanitize_filename(title)
+
+    if children:
+        # Container page → create directory
+        page_dir = CFG.base_output_dir / safe_title
+        page_dir.mkdir(parents=True, exist_ok=True)
+        page_path = page_dir / (safe_title + ".md")
+    else:
+        page_path = CFG.base_output_dir / (safe_title + ".md")
+
+    if page_path.exists():
+        print("WARNING: File already exists: %s" % page_path, flush=True)
+        print("  Use 'push' to update or delete the file first.", flush=True)
+        return False
+
+    # Build markdown content
+    fm_lines = [
+        "---",
+        "notion_parent: %s" % parent_id,
+        "title: %s" % title,
+        "---",
+    ]
+
+    body_lines = []
+    if children:
+        body_lines.append("")
+        for child_name in children:
+            safe_child = sanitize_filename(child_name)
+            child_dir = CFG.base_output_dir / safe_title / safe_child
+            child_dir.mkdir(parents=True, exist_ok=True)
+            child_path = child_dir / (safe_child + ".md")
+
+            # Create child .md
+            child_fm = [
+                "---",
+                "title: %s" % child_name,
+                "---",
+            ]
+            child_path.write_text("\n".join(child_fm) + "\n\n", encoding="utf-8")
+            print("  Created: %s" % child_path, flush=True)
+
+            # Add relative link in parent
+            rel = os.path.relpath(child_path, page_path.parent)
+            if " " in rel or "(" in rel or ")" in rel:
+                body_lines.append("[📄 %s](<%s>)" % (child_name, rel))
+            else:
+                body_lines.append("[📄 %s](%s)" % (child_name, rel))
+
+    page_path.write_text("\n".join(fm_lines) + "\n" + "\n".join(body_lines) + "\n", encoding="utf-8")
+    print("Created: %s" % page_path, flush=True)
+    print("", flush=True)
+    print("Next steps:", flush=True)
+    print("  1. Edit the .md files with your content", flush=True)
+    print("  2. Push to Notion:", flush=True)
+    if children:
+        print("     nsync push --recursive %s" % page_path, flush=True)
+    else:
+        print("     nsync push %s" % page_path, flush=True)
+    return True
+
+
+def _load_tree_cache():
+    """Load tree_cache.json and return items list."""
+    tc_path = CFG.sync_dir / "tree_cache.json"
+    if tc_path.exists():
+        with open(tc_path) as f:
+            data = json.load(f)
+        return data.get("items", [])
+    return []
+
+
+def _save_tree_cache_items(items):
+    """Save items to tree_cache.json, preserving other fields."""
+    tc_path = CFG.sync_dir / "tree_cache.json"
+    data = {}
+    if tc_path.exists():
+        with open(tc_path) as f:
+            data = json.load(f)
+    data["items"] = items
+    with open(tc_path, "w") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _create_notion_page(parent_id, title, blocks=None):
+    """Create a new Notion page under parent_id. Returns the new page ID or empty string."""
+    body = {
+        "parent": {"page_id": parent_id},
+        "properties": {
+            "title": {
+                "title": [{"text": {"content": title}}]
+            }
+        }
+    }
+    if blocks:
+        body["children"] = blocks[:100]
+
+    result = api_post("https://api.notion.com/v1/pages", body)
+    if not result:
+        print("ERROR: Failed to create page '%s'" % title, flush=True)
+        return ""
+
+    new_id = result.get("id", "")
+    print("  Created Notion page: %s (id: %s)" % (title, new_id[:8] + "..."), flush=True)
+
+    # If more than 100 blocks, append the rest
+    if blocks and len(blocks) > 100:
+        for i in range(100, len(blocks), 100):
+            chunk = blocks[i:i + 100]
+            api_patch("https://api.notion.com/v1/blocks/%s/children" % new_id, {"children": chunk})
+            time.sleep(CFG.rate_limit_delay)
+
+    time.sleep(CFG.rate_limit_delay)
+    return new_id
+
+
+def _find_children_in_md(md_text, page_dir):
+    """Parse child link references from markdown. Returns [(title, type, filepath), ...]."""
+    children = []
+    for match in _CHILD_LINK_RE_PARSE.finditer(md_text):
+        icon = match.group(1)
+        title = match.group(2)
+        rel_path = match.group(3)
+        child_type = "page" if icon == "📄" else "db"
+        child_fp = (page_dir / rel_path).resolve()
+        children.append((title, child_type, child_fp))
+    return children
+
+
+def _validate_push_structure(filepath, recursive=False):
+    """Validate structure before push. Returns (errors, warnings)."""
+    errors = []
+    warnings = []
+    p = Path(filepath)
+
+    if not p.exists():
+        errors.append("File not found: %s" % filepath)
+        return errors, warnings
+
+    text = p.read_text(encoding="utf-8")
+    fm, body = parse_front_matter(text)
+
+    notion_id = fm.get("notion_id", "")
+    notion_parent = fm.get("notion_parent", "")
+    title = fm.get("title", "")
+
+    if not notion_id and not notion_parent:
+        errors.append("No notion_id or notion_parent in front matter of %s" % p.name)
+    if not notion_id and not title:
+        errors.append("New page needs 'title' in front matter: %s" % p.name)
+
+    # Check child links
+    children = _find_children_in_md(body, p.parent)
+    for child_title, child_type, child_fp in children:
+        if not child_fp.exists():
+            errors.append("Child link target not found: %s (referenced in %s)" % (child_fp, p.name))
+        elif child_type == "page" and recursive:
+            child_text = child_fp.read_text(encoding="utf-8")
+            child_fm, _ = parse_front_matter(child_text)
+            if not child_fm.get("notion_id") and not child_fm.get("title"):
+                errors.append("Child page needs 'title' in front matter: %s" % child_fp.name)
+
+    # Check for duplicate names on Notion (if parent is known)
+    if not notion_id and notion_parent and title:
+        tree = _load_tree_cache()
+        for t_item in tree:
+            if t_item.get("title") == title:
+                warnings.append("DUPLICATE: A page named '%s' already exists on Notion (id: %s). Will be skipped." % (title, t_item["id"][:8]))
+
+    return errors, warnings
+
+
+def cmd_push_new(filepath, dry_run=False, recursive=False):
+    """Push a new local page (no notion_id) to Notion, creating it under notion_parent."""
+    p = Path(filepath)
+    text = p.read_text(encoding="utf-8")
+    fm, body = parse_front_matter(text)
+
+    title = fm.get("title", p.stem)
+    notion_parent = fm.get("notion_parent", "")
+
+    if not notion_parent:
+        print("ERROR: No notion_parent in front matter. Cannot create page.", flush=True)
+        return False
+
+    # Check for duplicate on Notion
+    tree = _load_tree_cache()
+    for t_item in tree:
+        if t_item.get("title") == title:
+            # Check if this is a direct child of the parent
+            parent_path = ""
+            for pt in tree:
+                if pt["id"] == notion_parent:
+                    parent_path = pt.get("path", "")
+                    break
+            t_path = t_item.get("path", "")
+            expected_prefix = parent_path + "/" if parent_path else ""
+            if t_path == expected_prefix + title or (not parent_path and t_path == title):
+                print("WARNING: Page '%s' already exists on Notion (id: %s). Skipping." % (title, t_item["id"][:8]), flush=True)
+                # Write back the existing notion_id so future pushes work
+                fm["notion_id"] = t_item["id"]
+                fm_lines = ["---"]
+                for k, v in fm.items():
+                    if k != "notion_parent":
+                        fm_lines.append("%s: %s" % (k, v))
+                fm_lines.append("---")
+                p.write_text("\n".join(fm_lines) + "\n\n" + body, encoding="utf-8")
+                print("  Linked existing page. Use 'push %s' to update content." % filepath, flush=True)
+                return True
+
+    # Parse child links so we only send content blocks (not wikilinks)
+    new_blocks = markdown_to_notion_blocks(body)
+    content_blocks = [b for b in new_blocks if not b.get("_wikilink")]
+
+    if dry_run:
+        print("=== Push New Page DRY RUN ===", flush=True)
+        print("File: %s" % filepath, flush=True)
+        print("Title: %s" % title, flush=True)
+        print("Parent: %s" % notion_parent, flush=True)
+        print("Content blocks: %d" % len(content_blocks), flush=True)
+
+        children = _find_children_in_md(body, p.parent)
+        if children:
+            print("Child references: %d" % len(children), flush=True)
+            for ct, ctype, cfp in children:
+                exists = "exists" if cfp.exists() else "MISSING"
+                print("  %s %s (%s)" % ("📄" if ctype == "page" else "🗃️", ct, exists), flush=True)
+        print("\n(dry-run: no changes written to Notion)", flush=True)
+        return True
+
+    print("=== Creating New Page on Notion ===", flush=True)
+    print("Title: %s" % title, flush=True)
+    print("Parent: %s" % notion_parent, flush=True)
+
+    new_id = _create_notion_page(notion_parent, title, content_blocks)
+    if not new_id:
+        return False
+
+    # Update front matter: remove notion_parent, add notion_id
+    now = datetime.now().isoformat()
+    new_fm = {"notion_id": new_id, "title": title, "synced_at": now, "pushed_at": now}
+    fm_lines = ["---"]
+    for k, v in new_fm.items():
+        fm_lines.append("%s: %s" % (k, v))
+    fm_lines.append("---")
+    p.write_text("\n".join(fm_lines) + "\n\n" + body, encoding="utf-8")
+
+    # Update sync_state
+    state = load_sync_state()
+    state.setdefault("items", {})[new_id] = {
+        "filepath": str(p),
+        "synced_at": now,
+        "pushed_at": now,
+        "content_hash": _file_content_hash(p),
+    }
+    save_sync_state(state)
+
+    # Update tree_cache
+    parent_item = None
+    for t in tree:
+        if t["id"] == notion_parent:
+            parent_item = t
+            break
+
+    parent_path = parent_item["path"] if parent_item else ""
+    new_tree_path = parent_path + "/" + title if parent_path else title
+    new_tree_item = {
+        "type": "page",
+        "title": title,
+        "path": new_tree_path,
+        "id": new_id,
+        "depth": (parent_item.get("depth", -1) + 1) if parent_item else 0,
+        "has_children": False,
+    }
+    tree.append(new_tree_item)
+    _save_tree_cache_items(tree)
+
+    print("Page created successfully.", flush=True)
+
+    # Recursive: create child pages
+    if recursive:
+        children = _find_children_in_md(body, p.parent)
+        if children:
+            print("Processing %d child references..." % len(children), flush=True)
+            for child_title, child_type, child_fp in children:
+                if child_type != "page":
+                    print("  Skipping DB reference: %s" % child_title, flush=True)
+                    continue
+                if not child_fp.exists():
+                    print("  WARNING: Child file not found: %s" % child_fp, flush=True)
+                    continue
+
+                child_text = child_fp.read_text(encoding="utf-8")
+                child_fm, child_body = parse_front_matter(child_text)
+
+                if child_fm.get("notion_id"):
+                    print("  Skipping (already has notion_id): %s" % child_title, flush=True)
+                    continue
+
+                # Set notion_parent to the newly created page
+                child_fm["notion_parent"] = new_id
+                if not child_fm.get("title"):
+                    child_fm["title"] = child_title
+                child_fm_lines = ["---"]
+                for k, v in child_fm.items():
+                    child_fm_lines.append("%s: %s" % (k, v))
+                child_fm_lines.append("---")
+                child_fp.write_text("\n".join(child_fm_lines) + "\n\n" + child_body, encoding="utf-8")
+
+                # Recursively push the child
+                cmd_push_new(str(child_fp), dry_run=False, recursive=True)
+
+        # Mark this page as container in tree
+        new_tree_item["has_children"] = True
+        _save_tree_cache_items(tree)
+
+    return True
+
+
 def _append_blocks(page_id, blocks, after_id=None):
     """Append blocks to a page, optionally after a specific block. Returns last new block ID."""
     if not blocks:
@@ -1735,7 +2086,7 @@ def _append_blocks(page_id, blocks, after_id=None):
     return last_id
 
 
-def cmd_push(filepath, dry_run=False):
+def cmd_push(filepath, dry_run=False, recursive=False):
     p = Path(filepath)
     if not p.exists():
         print("ERROR: File not found: %s" % filepath, flush=True)
@@ -1749,7 +2100,9 @@ def cmd_push(filepath, dry_run=False):
     notion_id = fm.get("notion_id", "")
 
     if not notion_id:
-        print("ERROR: No notion_id in front matter of %s" % filepath, flush=True)
+        if fm.get("notion_parent") or fm.get("title"):
+            return cmd_push_new(filepath, dry_run=dry_run, recursive=recursive)
+        print("ERROR: No notion_id or notion_parent in front matter of %s" % filepath, flush=True)
         return False
 
     new_blocks = markdown_to_notion_blocks(body)
@@ -1764,6 +2117,18 @@ def cmd_push(filepath, dry_run=False):
         if has_wikilinks:
             wl_count = sum(1 for b in new_blocks if b.get("_wikilink"))
             print("Child references (preserved): %d" % wl_count, flush=True)
+
+        # Structure validation
+        if recursive:
+            errs, warns = _validate_push_structure(filepath, recursive=True)
+            if warns:
+                print("", flush=True)
+                for w in warns:
+                    print("  ⚠ %s" % w, flush=True)
+            if errs:
+                print("", flush=True)
+                for e in errs:
+                    print("  ✗ %s" % e, flush=True)
         print("", flush=True)
         for i, blk in enumerate(new_blocks):
             if blk.get("_wikilink"):
@@ -1903,6 +2268,35 @@ def cmd_push(filepath, dry_run=False):
         save_sync_state(state)
 
     print("Push complete.", flush=True)
+
+    # Recursive: process child page links that don't have notion_id yet
+    if recursive:
+        children = _find_children_in_md(body, p.parent)
+        new_children = []
+        for child_title, child_type, child_fp in children:
+            if child_type != "page" or not child_fp.exists():
+                continue
+            child_text = child_fp.read_text(encoding="utf-8")
+            child_fm, child_body = parse_front_matter(child_text)
+            if child_fm.get("notion_id"):
+                # Already exists → push update recursively
+                cmd_push(str(child_fp), dry_run=False, recursive=True)
+            else:
+                # New child → set parent and create
+                child_fm["notion_parent"] = notion_id
+                if not child_fm.get("title"):
+                    child_fm["title"] = child_title
+                child_fm_lines = ["---"]
+                for k, v in child_fm.items():
+                    child_fm_lines.append("%s: %s" % (k, v))
+                child_fm_lines.append("---")
+                child_fp.write_text("\n".join(child_fm_lines) + "\n\n" + child_body, encoding="utf-8")
+                cmd_push_new(str(child_fp), dry_run=False, recursive=True)
+                new_children.append(child_title)
+
+        if new_children:
+            print("  Created %d child pages: %s" % (len(new_children), ", ".join(new_children)), flush=True)
+
     return True
 
 
@@ -2585,13 +2979,28 @@ def main():
             cmd_pull_recursive(pull_args[0], dry_run=dry_run)
         else:
             cmd_pull(pull_args[0], dry_run=dry_run)
+    elif command == "new":
+        new_args = [a for a in args[1:] if not a.startswith("--")]
+        children_str = ""
+        for i, a in enumerate(args):
+            if a == "--children" and i + 1 < len(args):
+                children_str = args[i + 1]
+                break
+        if len(new_args) < 2:
+            print('Usage: nsync.py new <parent-url-or-title> "Page Title" [--children "Child1,Child2"]', flush=True)
+            sys.exit(1)
+        parent_ref = new_args[0]
+        title = new_args[1]
+        children = [c.strip() for c in children_str.split(",") if c.strip()] if children_str else []
+        cmd_new(parent_ref, title, children)
     elif command == "push":
         dry_run = "--dry-run" in args
-        push_args = [a for a in args[1:] if a != "--dry-run"]
+        recursive = "--recursive" in args or "-r" in args
+        push_args = [a for a in args[1:] if a not in ("--dry-run", "--recursive", "-r")]
         if len(push_args) < 1:
-            print("Usage: nsync.py push [--dry-run] <filepath.md>", flush=True)
+            print('Usage: nsync.py push [--dry-run] [--recursive|-r] <filepath.md>', flush=True)
             sys.exit(1)
-        cmd_push(push_args[0], dry_run=dry_run)
+        cmd_push(push_args[0], dry_run=dry_run, recursive=recursive)
     elif command == "query":
         if len(args) < 3:
             print('Usage: nsync.py query <db_name> "SELECT ..."', flush=True)
@@ -2621,6 +3030,8 @@ def print_usage():
     print("  pull <file>        Pull single file from Notion (.md or .db)", flush=True)
     print("  pull -r <url>      Recursively pull a subtree by Notion URL", flush=True)
     print("  push <file>        Push local file to Notion (.md or .db)", flush=True)
+    print("  push -r <file>     Push recursively (create child pages too)", flush=True)
+    print('  new <parent> "Title" [--children "A,B,C"]  Scaffold new page', flush=True)
     print("  status             Show sync status", flush=True)
     print("  init-state         Init state from existing files", flush=True)
     print("  db-list            List all databases", flush=True)
