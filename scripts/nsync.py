@@ -1014,7 +1014,65 @@ def item_to_filepath(item):
     return None
 
 
-def download_item(item):
+def _resolve_child_links(md_text, parent_item, tree):
+    """Replace [[📄 Title]] wikilinks with [📄 Title](./relative/path) Markdown links."""
+    parent_filepath = item_to_filepath(parent_item)
+    if not parent_filepath:
+        return md_text
+    parent_dir = parent_filepath.parent
+    parent_path = parent_item.get("path", "")
+
+    # Build lookup for direct children by matching tree paths.
+    # Root page children have paths like "ChildTitle" (no parent prefix),
+    # non-root children have paths like "Parent/ChildTitle".
+    child_lookup = {}
+    prefix = parent_path + "/"
+    for t_item in tree:
+        if t_item["id"] == parent_item.get("id"):
+            continue
+        t_path = t_item.get("path", "")
+        is_direct_child = False
+        if parent_item.get("is_root"):
+            # Root's children: path has no "/" (top-level)
+            if "/" not in t_path:
+                is_direct_child = True
+        else:
+            if t_path.startswith(prefix):
+                remainder = t_path[len(prefix):]
+                if "/" not in remainder:
+                    is_direct_child = True
+
+        if is_direct_child:
+            child_lookup[(t_item["type"], t_item["title"])] = t_item
+
+    def _replace(match):
+        icon = match.group(1)
+        title = match.group(2)
+        child_type = "page" if icon == "\U0001f4c4" else "db"
+
+        child_item = child_lookup.get((child_type, title))
+        if not child_item:
+            return match.group(0)
+
+        if child_type == "page":
+            child_fp = item_to_filepath(child_item)
+        else:
+            child_fp = db_filepath(child_item["title"], child_item.get("path", ""))
+
+        if not child_fp:
+            return match.group(0)
+
+        try:
+            rel_path = os.path.relpath(child_fp, parent_dir)
+        except ValueError:
+            return match.group(0)
+
+        return "[%s %s](%s)" % (icon, title, rel_path)
+
+    return re.sub('\[\[(\U0001f4c4|\U0001f5c3\ufe0f)\s+(.+?)\]\]', _replace, md_text)
+
+
+def download_item(item, tree=None):
     if item["type"] == "page":
         filepath = item_to_filepath(item)
         if not filepath:
@@ -1022,6 +1080,8 @@ def download_item(item):
         filepath.parent.mkdir(parents=True, exist_ok=True)
 
         md = fetch_page_blocks_as_text(item["id"])
+        if tree:
+            md = _resolve_child_links(md, item, tree)
         now = datetime.now().isoformat()
         header = "---\nnotion_id: %s\nnotion_path: %s\nsynced_at: %s\n---\n\n" % (
             item["id"], item["path"], now
@@ -1146,12 +1206,14 @@ def _img_re_match(line):
     return None, None
 
 
-_WIKILINK_RE = re.compile(r'^\[\[(📄|🗃️)\s+(.+)\]\]$')
+_WIKILINK_RE = re.compile('^\[\[(\U0001f4c4|\U0001f5c3\ufe0f)\s+(.+)\]\]$')
+_CHILD_LINK_RE = re.compile('^\[(\U0001f4c4|\U0001f5c3\ufe0f)\s+(.+?)\]\((.+?)\)$')
 
 
 def markdown_to_notion_blocks(md_text):
-    """Convert Markdown to Notion blocks. Wikilinks are returned as placeholder dicts
-    with type '_wikilink' so callers can handle child block positioning."""
+    """Convert Markdown to Notion blocks. Child references (wikilink or relative link)
+    are returned as placeholder dicts with type '_wikilink' so callers can handle
+    child block positioning."""
     blocks = []
     lines = md_text.split("\n")
     i = 0
@@ -1159,9 +1221,11 @@ def markdown_to_notion_blocks(md_text):
         line = lines[i]
 
         wl = _WIKILINK_RE.match(line.strip())
-        if wl:
-            icon, title = wl.group(1), wl.group(2)
-            child_type = "child_page" if icon == "📄" else "child_database"
+        cl = _CHILD_LINK_RE.match(line.strip()) if not wl else None
+        if wl or cl:
+            m = wl or cl
+            icon, title = m.group(1), m.group(2)
+            child_type = "child_page" if icon == "\U0001f4c4" else "child_database"
             blocks.append({"_wikilink": True, "type": child_type, "title": title})
             i += 1
             continue
@@ -1343,6 +1407,25 @@ def cmd_pull(filepath, dry_run=False):
     print("Notion ID: %s" % notion_id, flush=True)
 
     md = fetch_page_blocks_as_text(notion_id)
+
+    # Resolve child links if tree cache available
+    if CFG.tree_json.exists() and notion_path:
+        try:
+            with open(CFG.tree_json) as f:
+                tree = json.load(f)
+            _mark_containers(tree)
+            parent_item = None
+            for t in tree:
+                if t["id"] == notion_id:
+                    parent_item = t
+                    break
+            if not parent_item:
+                parent_item = {"id": notion_id, "path": notion_path, "type": "page",
+                               "title": notion_path.split("/")[-1]}
+            md = _resolve_child_links(md, parent_item, tree)
+        except Exception:
+            pass
+
     now = datetime.now().isoformat()
 
     fm["synced_at"] = now
@@ -1548,13 +1631,20 @@ def cmd_pull_recursive(notion_url, dry_run=False):
         print("\n(dry-run: no files downloaded)", flush=True)
         return True
 
+    # Load full tree for link resolution
+    full_tree = all_items
+    if CFG.tree_json.exists():
+        with open(CFG.tree_json) as f:
+            full_tree = json.load(f)
+    _mark_containers(full_tree)
+
     state = load_sync_state()
     success = 0
     errors = 0
     print("\nDownloading %d items..." % len(all_items), flush=True)
     for idx, item in enumerate(all_items):
         try:
-            ok = download_item(item)
+            ok = download_item(item, tree=full_tree)
             if ok:
                 success += 1
                 entry = {
@@ -2064,7 +2154,7 @@ def cmd_sync(force=False, dry_run=False, refresh=False, no_push=False):
             item["title"][:60]
         ), flush=True)
 
-        ok = download_item(item)
+        ok = download_item(item, tree=tree)
         if ok:
             success += 1
         else:
