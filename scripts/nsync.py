@@ -495,8 +495,12 @@ def _get_child_blocks(block_id):
 def _block_to_md(b, depth=0):
     """Convert a single Notion block to (btype, md_line) tuples, handling nesting."""
     btype = b["type"]
-    if btype in ("child_page", "child_database"):
-        return []
+    if btype == "child_page":
+        title = b.get("child_page", {}).get("title", "")
+        return [(btype, "[[📄 %s]]" % title)]
+    if btype == "child_database":
+        title = b.get("child_database", {}).get("title", "")
+        return [(btype, "[[🗃️ %s]]" % title)]
     block_data = b.get(btype, {})
     rt = block_data.get("rich_text", [])
     text = rich_text_to_markdown(rt)
@@ -1142,12 +1146,25 @@ def _img_re_match(line):
     return None, None
 
 
+_WIKILINK_RE = re.compile(r'^\[\[(📄|🗃️)\s+(.+)\]\]$')
+
+
 def markdown_to_notion_blocks(md_text):
+    """Convert Markdown to Notion blocks. Wikilinks are returned as placeholder dicts
+    with type '_wikilink' so callers can handle child block positioning."""
     blocks = []
     lines = md_text.split("\n")
     i = 0
     while i < len(lines):
         line = lines[i]
+
+        wl = _WIKILINK_RE.match(line.strip())
+        if wl:
+            icon, title = wl.group(1), wl.group(2)
+            child_type = "child_page" if icon == "📄" else "child_database"
+            blocks.append({"_wikilink": True, "type": child_type, "title": title})
+            i += 1
+            continue
 
         if line.startswith("```"):
             lang = _normalize_lang(line[3:].strip())
@@ -1569,6 +1586,62 @@ def cmd_pull_recursive(notion_url, dry_run=False):
     return errors == 0
 
 
+def _match_wikilink_to_child(wl_block, child_blocks):
+    """Match a wikilink placeholder to an existing child block by title and type."""
+    wl_title = wl_block["title"].strip()
+    wl_type = wl_block["type"]
+    for cb in child_blocks:
+        cb_type = cb["type"]
+        cb_title = cb.get(cb_type, {}).get("title", "").strip()
+        if cb_type == wl_type and cb_title == wl_title:
+            return cb
+    return None
+
+
+def _split_blocks_by_wikilinks(new_blocks, child_blocks):
+    """Split block list into segments around wikilink placeholders.
+
+    Returns list of (segment_blocks, child_block_or_None) tuples.
+    Each segment is content that goes BEFORE the paired child block.
+    The last segment has child_block=None (content after all children).
+    """
+    segments = []
+    current_segment = []
+
+    for blk in new_blocks:
+        if blk.get("_wikilink"):
+            matched = _match_wikilink_to_child(blk, child_blocks)
+            segments.append((current_segment, matched))
+            current_segment = []
+        else:
+            current_segment.append(blk)
+
+    segments.append((current_segment, None))
+    return segments
+
+
+def _append_blocks(page_id, blocks, after_id=None):
+    """Append blocks to a page, optionally after a specific block. Returns last new block ID."""
+    if not blocks:
+        return after_id
+    url = "https://api.notion.com/v1/blocks/%s/children" % page_id
+    last_id = after_id
+    for i in range(0, len(blocks), 100):
+        chunk = blocks[i:i + 100]
+        body = {"children": chunk}
+        if last_id:
+            body["after"] = last_id
+        result = api_patch(url, body)
+        if not result:
+            print("  ERROR: Failed to append blocks (chunk %d)" % (i // 100), flush=True)
+            return last_id
+        new_results = result.get("results", [])
+        if new_results:
+            last_id = new_results[-1]["id"]
+        time.sleep(CFG.rate_limit_delay)
+    return last_id
+
+
 def cmd_push(filepath, dry_run=False):
     p = Path(filepath)
     if not p.exists():
@@ -1587,14 +1660,23 @@ def cmd_push(filepath, dry_run=False):
         return False
 
     new_blocks = markdown_to_notion_blocks(body)
+    has_wikilinks = any(blk.get("_wikilink") for blk in new_blocks)
 
     if dry_run:
         print("=== Push DRY RUN ===", flush=True)
         print("File: %s" % filepath, flush=True)
         print("Notion ID: %s" % notion_id, flush=True)
-        print("Blocks to upload: %d" % len(new_blocks), flush=True)
+        content_blocks = [b for b in new_blocks if not b.get("_wikilink")]
+        print("Blocks to upload: %d" % len(content_blocks), flush=True)
+        if has_wikilinks:
+            wl_count = sum(1 for b in new_blocks if b.get("_wikilink"))
+            print("Child references (preserved): %d" % wl_count, flush=True)
         print("", flush=True)
         for i, blk in enumerate(new_blocks):
+            if blk.get("_wikilink"):
+                icon = "📄" if blk["type"] == "child_page" else "🗃️"
+                print("  [%d] %s: [[%s %s]]" % (i + 1, blk["type"], icon, blk["title"]), flush=True)
+                continue
             bt = blk.get("type", "?")
             rt = blk.get(bt, {}).get("rich_text", [])
             preview = "".join(s.get("text", {}).get("content", "")[:60] for s in rt[:2])
@@ -1612,25 +1694,103 @@ def cmd_push(filepath, dry_run=False):
     print("File: %s" % filepath, flush=True)
     print("Notion ID: %s" % notion_id, flush=True)
 
-    print("Removing existing blocks...", flush=True)
     existing = get_blocks(notion_id)
-    for b in existing:
-        if b["type"] in ("child_page", "child_database"):
-            continue
-        api_delete("https://api.notion.com/v1/blocks/%s" % b["id"])
-        time.sleep(CFG.rate_limit_delay)
+    child_blocks = [b for b in existing if b["type"] in ("child_page", "child_database")]
+    non_child_blocks = [b for b in existing if b["type"] not in ("child_page", "child_database")]
 
-    print("Uploading %d blocks..." % len(new_blocks), flush=True)
+    if has_wikilinks and child_blocks:
+        print("Position-aware push (%d children detected)..." % len(child_blocks), flush=True)
+        segments = _split_blocks_by_wikilinks(new_blocks, child_blocks)
 
-    url = "https://api.notion.com/v1/blocks/%s/children" % notion_id
-    for i in range(0, len(new_blocks), 100):
-        chunk = new_blocks[i:i + 100]
-        result = api_patch(url, {"children": chunk})
-        if not result:
-            print("  ERROR: Failed to append blocks (chunk %d)" % (i // 100), flush=True)
-            return False
-        time.sleep(CFG.rate_limit_delay)
-        print("  Uploaded blocks %d-%d" % (i + 1, min(i + 100, len(new_blocks))), flush=True)
+        # Strategy: insert new content using existing blocks as anchors,
+        # then delete old non-child blocks.
+        #
+        # For seg_0 (before first child): insert after the last OLD block
+        # that precedes the first child, then delete old blocks later.
+        # For seg_N: insert after child_N using `after` parameter.
+
+        # Build a map: for each child block, find the OLD block just before it
+        old_block_ids = set(b["id"] for b in non_child_blocks)
+        anchor_before_first_child = None
+        for b in existing:
+            if b["type"] in ("child_page", "child_database"):
+                break
+            anchor_before_first_child = b["id"]
+
+        # Pass 1: Insert content segments in order
+        content_count = 0
+        for seg_idx, (seg_blocks, paired_child) in enumerate(segments):
+            if not seg_blocks:
+                if paired_child:
+                    continue
+                continue
+
+            if seg_idx == 0 and paired_child:
+                # First segment (before first child)
+                if anchor_before_first_child:
+                    print("  Inserting segment 0 (%d blocks, before first child)..." % len(seg_blocks), flush=True)
+                    _append_blocks(notion_id, seg_blocks, after_id=anchor_before_first_child)
+                else:
+                    # Edge case: child is the very first block, no anchor available.
+                    # Append at end; will be after all children (unavoidable API limitation).
+                    print("  Inserting segment 0 (%d blocks, appending)..." % len(seg_blocks), flush=True)
+                    _append_blocks(notion_id, seg_blocks, after_id=None)
+                content_count += len(seg_blocks)
+            elif paired_child:
+                # Content before this child → insert after the PREVIOUS child
+                prev_child_id = None
+                for prev_seg_idx in range(seg_idx - 1, -1, -1):
+                    pc = segments[prev_seg_idx][1]
+                    if pc:
+                        prev_child_id = pc["id"]
+                        break
+                if prev_child_id:
+                    print("  Inserting segment %d (%d blocks, after child)..." % (seg_idx, len(seg_blocks)), flush=True)
+                    _append_blocks(notion_id, seg_blocks, after_id=prev_child_id)
+                else:
+                    _append_blocks(notion_id, seg_blocks, after_id=anchor_before_first_child)
+                content_count += len(seg_blocks)
+            else:
+                # Last segment (after all children)
+                last_child_id = None
+                for s_idx in range(len(segments) - 2, -1, -1):
+                    pc = segments[s_idx][1]
+                    if pc:
+                        last_child_id = pc["id"]
+                        break
+                if last_child_id:
+                    print("  Inserting final segment (%d blocks, after last child)..." % len(seg_blocks), flush=True)
+                    _append_blocks(notion_id, seg_blocks, after_id=last_child_id)
+                else:
+                    _append_blocks(notion_id, seg_blocks, after_id=None)
+                content_count += len(seg_blocks)
+
+        # Pass 2: Delete old non-child blocks
+        print("  Removing %d old blocks..." % len(non_child_blocks), flush=True)
+        for b in non_child_blocks:
+            api_delete("https://api.notion.com/v1/blocks/%s" % b["id"])
+            time.sleep(CFG.rate_limit_delay)
+
+        print("  Uploaded %d content blocks, preserved %d children" % (content_count, len(child_blocks)), flush=True)
+
+    else:
+        # Simple push: no wikilinks or no children
+        print("Removing existing blocks...", flush=True)
+        for b in non_child_blocks:
+            api_delete("https://api.notion.com/v1/blocks/%s" % b["id"])
+            time.sleep(CFG.rate_limit_delay)
+
+        content_blocks = [b for b in new_blocks if not b.get("_wikilink")]
+        print("Uploading %d blocks..." % len(content_blocks), flush=True)
+        url = "https://api.notion.com/v1/blocks/%s/children" % notion_id
+        for i in range(0, len(content_blocks), 100):
+            chunk = content_blocks[i:i + 100]
+            result = api_patch(url, {"children": chunk})
+            if not result:
+                print("  ERROR: Failed to append blocks (chunk %d)" % (i // 100), flush=True)
+                return False
+            time.sleep(CFG.rate_limit_delay)
+            print("  Uploaded blocks %d-%d" % (i + 1, min(i + 100, len(content_blocks))), flush=True)
 
     now = datetime.now().isoformat()
     fm["synced_at"] = now
