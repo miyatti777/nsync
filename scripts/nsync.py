@@ -256,7 +256,14 @@ def _api_request(url, method="GET", body_dict=None, retries=None):
                 return None
             else:
                 _api_stats["errors"] += 1
+                err_body = ""
+                try:
+                    err_body = e.read().decode("utf-8", errors="replace")[:500]
+                except Exception:
+                    pass
                 print("  HTTP %d on attempt %d: %s" % (e.code, attempt + 1, url), flush=True)
+                if err_body:
+                    print("  Response: %s" % err_body, flush=True)
                 if attempt < retries - 1:
                     time.sleep(CFG.retry_backoff ** attempt)
                     continue
@@ -938,6 +945,12 @@ def extract_property_value(prop):
         return ", ".join(r.get("id", "") for r in prop.get("relation", []))
     elif ptype == "people":
         return ", ".join(p.get("name", p.get("id", "")) for p in prop.get("people", []))
+    elif ptype == "created_by":
+        u = prop.get("created_by")
+        return u.get("name", u.get("id", "")) if u else ""
+    elif ptype == "last_edited_by":
+        u = prop.get("last_edited_by")
+        return u.get("name", u.get("id", "")) if u else ""
     elif ptype == "created_time":
         return prop.get("created_time", "")
     elif ptype == "last_edited_time":
@@ -1068,6 +1081,9 @@ def _download_db_file_assets(rows, columns, db_assets_dir):
                 continue
             local_paths = []
             for url in urls:
+                if not url.startswith(("http://", "https://")):
+                    local_paths.append(url)
+                    continue
                 if "amazonaws.com" not in url and "notion-static.com" not in url:
                     local_paths.append(url)
                     continue
@@ -2487,6 +2503,33 @@ def _infer_parent_from_path(filepath):
     return None
 
 
+def _has_nested_child_pages(block):
+    """Check if a block has nested child_page or child_database among its children."""
+    if not block.get("has_children"):
+        return False
+    children = _get_child_blocks(block["id"])
+    for c in children:
+        if c["type"] in ("child_page", "child_database"):
+            return True
+        if c.get("has_children") and _has_nested_child_pages(c):
+            return True
+    return False
+
+
+def _safe_delete_blocks(blocks_to_delete):
+    """Delete blocks, skipping any that contain nested child pages/databases."""
+    skipped = []
+    for b in blocks_to_delete:
+        if _has_nested_child_pages(b):
+            skipped.append(b)
+            print("  SKIP delete block %s (%s) — contains nested child pages" % (
+                b["id"][:12], b["type"]), flush=True)
+            continue
+        api_delete("https://api.notion.com/v1/blocks/%s" % b["id"])
+        time.sleep(CFG.rate_limit_delay)
+    return skipped
+
+
 def _append_blocks(page_id, blocks, after_id=None):
     """Append blocks to a page, optionally after a specific block. Returns last new block ID."""
     if not blocks:
@@ -2759,20 +2802,16 @@ def cmd_push(filepath, dry_run=False, recursive=False):
                     _append_blocks(notion_id, seg_blocks, after_id=None)
                 content_count += len(seg_blocks)
 
-        # Pass 2: Delete old non-child blocks
+        # Pass 2: Delete old non-child blocks (safe: skip blocks with nested child pages)
         print("  Removing %d old blocks..." % len(non_child_blocks), flush=True)
-        for b in non_child_blocks:
-            api_delete("https://api.notion.com/v1/blocks/%s" % b["id"])
-            time.sleep(CFG.rate_limit_delay)
+        skipped = _safe_delete_blocks(non_child_blocks)
 
         print("  Uploaded %d content blocks, preserved %d children" % (content_count, len(child_blocks)), flush=True)
 
     else:
         # Simple push: no wikilinks or no children
         print("Removing existing blocks...", flush=True)
-        for b in non_child_blocks:
-            api_delete("https://api.notion.com/v1/blocks/%s" % b["id"])
-            time.sleep(CFG.rate_limit_delay)
+        skipped = _safe_delete_blocks(non_child_blocks)
 
         content_blocks = [b for b in new_blocks if not b.get("_wikilink")]
         print("Uploading %d blocks..." % len(content_blocks), flush=True)
