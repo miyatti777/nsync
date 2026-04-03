@@ -53,7 +53,7 @@ python3 <skill_dir>/scripts/nsync.py query backlog "SELECT * FROM data LIMIT 10"
 <output_dir>/             # ターゲットごとに init で生成
 ├── .nsync.yaml           # 設定ファイル
 ├── nsync.sh              # thin wrapper (自動生成・ポータブル)
-├── _sync/
+├── _nsync/               # nsync専用状態ディレクトリ（csyncの _csync/ と共存可能）
 │   ├── .env              # ローカルトークン（省略可、共通が使われる）
 │   ├── tree_cache.json   # クロール結果キャッシュ
 │   └── sync_state.json   # 差分同期状態
@@ -69,7 +69,7 @@ python3 <skill_dir>/scripts/nsync.py query backlog "SELECT * FROM data LIMIT 10"
 トークンは以下の優先順位で解決される:
 
 1. `NOTION_API_TOKEN` 環境変数
-2. `<output_dir>/_sync/.env` — ワークスペース固有（異なるトークンが必要な場合）
+2. `<output_dir>/_nsync/.env` — ワークスペース固有（異なるトークンが必要な場合）
 3. `<skill_dir>/.env` — 共通トークン（通常はこれだけでOK）
 
 初回セットアップ:
@@ -90,7 +90,7 @@ python3 <skill_dir>/scripts/nsync.py init <notion-url> [output-dir]
 `init` は以下を自動実行:
 - `.nsync.yaml` 生成（Notion APIからページタイトルを取得してlabel設定）
 - `nsync.sh` 生成（共通トークンへのフォールバック付き）
-- `_sync/.env` にトークンをコピー（共通トークンがある場合）
+- `_nsync/.env` にトークンをコピー（共通トークンがある場合）
 
 ### 2. 同期
 

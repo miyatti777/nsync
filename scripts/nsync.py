@@ -47,7 +47,7 @@ class Config:
         self.rate_limit_delay = 0.35
         self.max_retries = 3
         self.retry_backoff = 2.0
-        self.exclude_paths = ["_sync", "_archived"]
+        self.exclude_paths = ["_nsync", "_csync", "_archived", "_sync"]
         self.db_page_content = True
 
 CFG = Config()
@@ -90,15 +90,29 @@ def load_config(config_path):
     CFG.root_page_id = data.get("root_page_id", "")
     CFG.label = data.get("label", "Notion")
     CFG.base_output_dir = p.parent
-    CFG.sync_dir = p.parent / "_sync"
+    CFG.sync_dir = p.parent / "_nsync"
     CFG.tree_json = CFG.sync_dir / "tree_cache.json"
     CFG.sync_state_json = CFG.sync_dir / "sync_state.json"
     CFG.crawl_max_depth = data.get("crawl_max_depth", 10)
     CFG.rate_limit_delay = data.get("rate_limit_delay", 0.35)
     CFG.max_retries = data.get("max_retries", 3)
     CFG.retry_backoff = data.get("retry_backoff", 2.0)
-    CFG.exclude_paths = data.get("exclude_paths", ["_sync", "_archived"])
+    CFG.exclude_paths = data.get("exclude_paths", ["_nsync", "_csync", "_archived", "_sync"])
     CFG.db_page_content = data.get("db_page_content", True)
+    _migrate_sync_dir(p.parent)
+
+
+def _migrate_sync_dir(base_dir):
+    """Auto-migrate legacy _sync/ to _nsync/ if the new dir does not exist."""
+    old = base_dir / "_sync"
+    new = base_dir / "_nsync"
+    if old.is_dir() and not new.exists():
+        other_config_exists = (base_dir / ".csync.yaml").exists()
+        if other_config_exists:
+            print("WARN: _sync/ exists but both .nsync.yaml and .csync.yaml found. Manual migration needed.", flush=True)
+            return
+        old.rename(new)
+        print("Migrated: _sync/ -> _nsync/", flush=True)
 
 
 def _parse_simple_yaml(text):
@@ -175,7 +189,7 @@ def extract_page_id_from_url(url):
 _crawl_state = {"items": None, "queue": None, "active": False}
 
 def _heartbeat_path():
-    return Path(CFG.base_output_dir) / "_sync" / "heartbeat"
+    return Path(CFG.base_output_dir) / "_nsync" / "heartbeat"
 
 def _write_heartbeat():
     """Write current timestamp to heartbeat file for external monitoring."""
@@ -1289,14 +1303,25 @@ def save_sync_state(state):
         json.dump(state, f, indent=2, ensure_ascii=False)
 
 
+def _strip_front_matter_bytes(data):
+    """Remove YAML front matter (---...---) from raw bytes for hashing."""
+    sep = b"---"
+    if not data.startswith(sep):
+        return data
+    end = data.find(b"\n---", len(sep))
+    if end == -1:
+        return data
+    nl = data.find(b"\n", end + 4)
+    return data[nl + 1:] if nl != -1 else b""
+
+
 def _file_content_hash(filepath):
-    """Compute SHA256 hash of file content. Returns hex string or empty on error."""
+    """Compute SHA256 hash of file body (excluding front matter). Returns hex string or empty on error."""
     try:
-        h = hashlib.sha256()
         with open(filepath, "rb") as f:
-            for chunk in iter(lambda: f.read(8192), b""):
-                h.update(chunk)
-        return h.hexdigest()
+            data = f.read()
+        body = _strip_front_matter_bytes(data)
+        return hashlib.sha256(body).hexdigest()
     except OSError:
         return ""
 
@@ -1562,7 +1587,40 @@ def markdown_to_notion_blocks(md_text):
             i += 1
             continue
 
-        if line.startswith("```"):
+        if re.match(r'^\s*\|.*\|', line):
+            table_rows = []
+            while i < len(lines) and re.match(r'^\s*\|.*\|', lines[i]):
+                row_text = lines[i].strip()
+                if re.match(r'^\|[\s\-:|]+\|$', row_text):
+                    i += 1
+                    continue
+                cells = [c.strip() for c in row_text.strip('|').split('|')]
+                table_rows.append(cells)
+                i += 1
+            if table_rows:
+                col_count = max(len(r) for r in table_rows)
+                row_blocks = []
+                for row in table_rows:
+                    while len(row) < col_count:
+                        row.append("")
+                    cell_rts = []
+                    for cell in row:
+                        cell_rts.append(parse_inline_markdown(cell) if cell else [])
+                    row_blocks.append({
+                        "object": "block", "type": "table_row",
+                        "table_row": {"cells": cell_rts}
+                    })
+                blocks.append({
+                    "object": "block", "type": "table",
+                    "table": {
+                        "table_width": col_count,
+                        "has_column_header": True,
+                        "has_row_header": False,
+                        "children": row_blocks,
+                    },
+                })
+            continue
+        elif line.startswith("```"):
             lang = _normalize_lang(line[3:].strip())
             code_lines = []
             i += 1
@@ -1603,21 +1661,45 @@ def markdown_to_notion_blocks(md_text):
         elif line.startswith("# "):
             blocks.append({"object": "block", "type": "heading_1",
                 "heading_1": {"rich_text": parse_inline_markdown(line[2:])}})
-        elif line.startswith("- ["):
-            checked = len(line) > 3 and line[3] == "x"
-            text = line[6:] if len(line) > 6 else ""
+        elif re.match(r'^- \[[ x]\] ', line):
+            checked = line[3] == "x"
+            text = line[6:]
             blocks.append({"object": "block", "type": "to_do",
                 "to_do": {"rich_text": parse_inline_markdown(text), "checked": checked}})
-        elif line.startswith("- "):
+        elif re.match(r'^(\s*)- ', line):
+            text = re.sub(r'^\s*- ', '', line)
             blocks.append({"object": "block", "type": "bulleted_list_item",
-                "bulleted_list_item": {"rich_text": parse_inline_markdown(line[2:])}})
-        elif re.match(r'^\d+\.\s', line):
-            text = re.sub(r'^\d+\.\s', '', line)
+                "bulleted_list_item": {"rich_text": parse_inline_markdown(text)}})
+        elif re.match(r'^\s*\d+\.\s', line):
+            text = re.sub(r'^\s*\d+\.\s', '', line)
             blocks.append({"object": "block", "type": "numbered_list_item",
                 "numbered_list_item": {"rich_text": parse_inline_markdown(text)}})
-        elif line.startswith("> "):
+        elif line.startswith("> ") or line == ">":
+            quote_parts = [line[2:] if line.startswith("> ") else ""]
+            j = i + 1
+            while j < len(lines):
+                nxt = lines[j]
+                if nxt.startswith("> ") or nxt == ">":
+                    quote_parts.append(nxt[2:] if nxt.startswith("> ") else "")
+                    j += 1
+                elif nxt.strip() == "":
+                    k = j + 1
+                    while k < len(lines) and lines[k].strip() == "":
+                        k += 1
+                    if k < len(lines) and lines[k].startswith("  ") and not lines[k].strip().startswith("#") and not lines[k].strip() == "---":
+                        quote_parts.append("")
+                        j += 1
+                    else:
+                        break
+                elif nxt.startswith("  ") and not nxt.strip().startswith("#") and not nxt.strip().startswith("- ") and not re.match(r'^\s*\d+\.\s', nxt) and not nxt.strip() == "---":
+                    quote_parts.append(nxt.strip())
+                    j += 1
+                else:
+                    break
+            i = j - 1
+            combined = "\n".join(quote_parts)
             blocks.append({"object": "block", "type": "quote",
-                "quote": {"rich_text": parse_inline_markdown(line[2:])}})
+                "quote": {"rich_text": parse_inline_markdown(combined)}})
         elif line.strip() == "---":
             blocks.append({"object": "block", "type": "divider", "divider": {}})
         else:
@@ -2350,10 +2432,15 @@ def cmd_push_new(filepath, dry_run=False, recursive=False):
         return False
 
     # Update front matter: remove notion_parent, add notion_id
+    # Preserve non-nsync fields (e.g. confluence_id from csync)
     now = datetime.now().isoformat()
-    new_fm = {"notion_id": new_id, "title": title, "synced_at": now, "pushed_at": now}
+    fm.pop("notion_parent", None)
+    fm["notion_id"] = new_id
+    fm["title"] = title
+    fm["synced_at"] = now
+    fm["pushed_at"] = now
     fm_lines = ["---"]
-    for k, v in new_fm.items():
+    for k, v in fm.items():
         fm_lines.append("%s: %s" % (k, v))
     fm_lines.append("---")
     p.write_text("\n".join(fm_lines) + "\n\n" + body, encoding="utf-8")
@@ -3124,6 +3211,66 @@ def _detect_renames(tree, state):
     return renames
 
 
+def _detect_new_local_files(state):
+    """Detect local .md files that have no notion_id and are not yet tracked.
+
+    Scans the workspace for .md files, skips those already in sync state or
+    those inside excluded paths. Returns list of Path objects for new files.
+    """
+    tracked_paths = set()
+    for entry in state.get("items", {}).values():
+        p = entry.get("path", "")
+        if p:
+            tracked_paths.add(p)
+
+    new_files = []
+    excl = CFG.exclude_paths + ["_assets", "_db_assets", ".nsync.yaml"]
+    for md_file in CFG.base_output_dir.rglob("*.md"):
+        if any(e in str(md_file) for e in excl):
+            continue
+        if md_file.name == ".DS_Store":
+            continue
+        try:
+            text = md_file.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        fm, _ = parse_front_matter(text)
+        if fm.get("notion_id"):
+            continue
+        new_files.append(md_file)
+    return new_files
+
+
+def _auto_push_new_files(new_files, dry_run=False):
+    """Push new local files (no notion_id) to Notion as new pages.
+
+    Returns count of successfully pushed files.
+    """
+    if not new_files:
+        return 0
+
+    print("--- New Local Files Detected ---", flush=True)
+    print("Found %d new local file(s) to create on Notion" % len(new_files), flush=True)
+
+    pushed = 0
+    for filepath in new_files:
+        rel = filepath.relative_to(CFG.base_output_dir)
+        if dry_run:
+            print("  CREATE (dry): %s" % rel, flush=True)
+            continue
+
+        print("  CREATE: %s" % rel, flush=True)
+        ok = cmd_push(str(filepath), dry_run=False)
+        if ok:
+            pushed += 1
+        else:
+            print("  WARN: Create failed for %s" % rel, flush=True)
+
+    print("Created: %d" % pushed, flush=True)
+    print(flush=True)
+    return pushed
+
+
 def cmd_sync(force=False, dry_run=False, refresh=False, no_push=False):
     if refresh or not CFG.tree_json.exists():
         if not CFG.tree_json.exists():
@@ -3198,6 +3345,12 @@ def cmd_sync(force=False, dry_run=False, refresh=False, no_push=False):
             updated_items = [i for i in updated_items if i["id"] not in conflict_ids]
     else:
         conflict_ids = set()
+
+    # Phase 3.5: Push new local files (no notion_id) to Notion
+    if not no_push:
+        new_local_files = _detect_new_local_files(state)
+        if new_local_files:
+            _auto_push_new_files(new_local_files, dry_run=dry_run)
 
     print("New: %d, Updated: %d, Unchanged: %d" % (len(new_items), len(updated_items), unchanged), flush=True)
     if conflict_ids:
@@ -3511,7 +3664,7 @@ def cmd_init_workspace(notion_url, output_dir):
 
     out = Path(output_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
-    sync_dir = out / "_sync"
+    sync_dir = out / "_nsync"
     sync_dir.mkdir(exist_ok=True)
 
     notion_title = _fetch_page_title(page_id)
@@ -3525,8 +3678,10 @@ label: "%s"
 crawl_max_depth: 10
 rate_limit_delay: 0.35
 exclude_paths:
-  - "_sync"
+  - "_nsync"
+  - "_csync"
   - "_archived"
+  - "_sync"
 """ % (page_id, label)
     config_path.write_text(config_content, encoding="utf-8")
     print("Created: %s" % config_path, flush=True)
@@ -3563,7 +3718,7 @@ if [ -z "$NSYNC" ]; then
   exit 1
 fi
 SKILL_DIR="$(dirname "$(dirname "$NSYNC")")"
-if [ -f "$DIR/_sync/.env" ]; then set -a; . "$DIR/_sync/.env"; set +a; fi
+if [ -f "$DIR/_nsync/.env" ]; then set -a; . "$DIR/_nsync/.env"; set +a; fi
 if [ -z "$NOTION_API_TOKEN" ] && [ -f "$SKILL_DIR/.env" ]; then set -a; . "$SKILL_DIR/.env"; set +a; fi
 [ -z "$NOTION_API_TOKEN" ] && echo "ERROR: NOTION_API_TOKEN not set." && exit 1
 python3 "$NSYNC" --config "$DIR/.nsync.yaml" "${@:-sync}"
@@ -3617,7 +3772,7 @@ def main():
         return
 
     if not config_path:
-        for candidate in [".nsync.yaml", "_sync/.nsync.yaml"]:
+        for candidate in [".nsync.yaml", "_nsync/.nsync.yaml", "_sync/.nsync.yaml"]:
             if Path(candidate).exists():
                 config_path = candidate
                 break

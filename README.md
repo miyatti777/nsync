@@ -79,7 +79,7 @@ python3 .claude/skills/nsync/scripts/nsync.py init \
 `init` は以下を自動実行:
 - `.nsync.yaml` 生成（Notion APIからページタイトルを取得してlabel設定）
 - `nsync.sh` 生成（ポータブルなラッパースクリプト）
-- `_sync/.env` にトークンをコピー
+- `_nsync/.env` にトークンをコピー
 
 ### 2. 同期
 
@@ -121,7 +121,7 @@ cd projects/my-project
 <output_dir>/
 ├── .nsync.yaml           # 設定ファイル
 ├── nsync.sh              # ラッパースクリプト（自動生成）
-├── _sync/
+├── _nsync/                # nsync専用（csyncの _csync/ と共存可能）
 │   ├── .env              # ローカルトークン（省略可）
 │   ├── tree_cache.json   # クロール結果キャッシュ
 │   └── sync_state.json   # 差分同期状態
@@ -137,7 +137,7 @@ cd projects/my-project
 トークンは以下の優先順位で解決されます:
 
 1. `NOTION_API_TOKEN` 環境変数
-2. `<output_dir>/_sync/.env` — ワークスペース固有
+2. `<output_dir>/_nsync/.env` — ワークスペース固有
 3. `<skill_dir>/.env` — 共通トークン（通常はこれだけでOK）
 
 ## 設定 (.nsync.yaml)
@@ -148,8 +148,10 @@ label: "My Project"
 crawl_max_depth: 10
 rate_limit_delay: 0.35
 exclude_paths:
-  - "_sync"
+  - "_nsync"
+  - "_csync"
   - "_archived"
+  - "_sync"
 ```
 
 | Key | 説明 | デフォルト |
@@ -159,7 +161,7 @@ exclude_paths:
 | `crawl_max_depth` | クロールの最大深度 | `10` |
 | `rate_limit_delay` | API呼び出し間の待機秒数 | `0.35` |
 | `db_page_content` | DB各行のページ本文を `_body` カラムに格納 | `true` |
-| `exclude_paths` | 検索から除外するパス | `["_sync", "_archived"]` |
+| `exclude_paths` | 検索から除外するパス | `["_nsync", "_csync", "_archived", "_sync"]` |
 
 ## AI アシスタントからの使い方
 
@@ -516,7 +518,7 @@ export NSYNC_SCRIPT=/path/to/nsync.py
 ## クロールの再開
 
 大規模なNotionツリー（数百ページ以上）のクロールは時間がかかることがあります。
-nsync はクロール中に50件ごとにチェックポイントを `_sync/crawl_checkpoint.json` に保存します。
+nsync はクロール中に50件ごとにチェックポイントを `_nsync/crawl_checkpoint.json` に保存します。
 
 プロセスが中断した場合（タイムアウト、ネットワークエラーなど）、次回 `sync` 実行時にチェックポイントから自動的に再開します。
 
