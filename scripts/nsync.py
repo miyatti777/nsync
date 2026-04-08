@@ -311,6 +311,91 @@ def api_delete(url, retries=None):
 
 
 # ==========================================
+# Markdown API (Enhanced Markdown endpoints)
+# ==========================================
+
+_MARKDOWN_API_VERSION = "2026-03-11"
+
+
+def _api_request_markdown(url, method="GET", body_dict=None, retries=None):
+    """API request using Markdown API version header."""
+    if retries is None:
+        retries = CFG.max_retries
+    headers = dict(HEADERS)
+    headers["Notion-Version"] = _MARKDOWN_API_VERSION
+    data_bytes = json.dumps(body_dict).encode() if body_dict else None
+    consecutive_429 = 0
+
+    for attempt in range(retries):
+        req = urllib.request.Request(url, data=data_bytes, headers=headers, method=method)
+        _api_stats["calls"] += 1
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                _api_stats["rate_limits"] += 1
+                consecutive_429 += 1
+                retry_after = e.headers.get("Retry-After")
+                wait = max(float(retry_after), 1.0) if retry_after else CFG.retry_backoff ** (attempt + 1)
+                print("  Rate limited (429). Waiting %.1fs..." % wait, flush=True)
+                if consecutive_429 >= retries:
+                    _api_stats["errors"] += 1
+                    raise RateLimitExhausted("Too many 429s on markdown API")
+                time.sleep(wait)
+                continue
+            else:
+                _api_stats["errors"] += 1
+                err_body = ""
+                try:
+                    err_body = e.read().decode("utf-8", errors="replace")[:500]
+                except Exception:
+                    pass
+                print("  Markdown API HTTP %d: %s" % (e.code, err_body), flush=True)
+                if attempt < retries - 1:
+                    time.sleep(CFG.retry_backoff ** attempt)
+                    continue
+                return None
+        except RateLimitExhausted:
+            raise
+        except Exception as e:
+            _api_stats["errors"] += 1
+            print("  Markdown API error: %s" % e, flush=True)
+            if attempt < retries - 1:
+                time.sleep(CFG.retry_backoff ** attempt)
+                continue
+            return None
+    return None
+
+
+def api_get_markdown(page_id):
+    """GET /v1/pages/:page_id/markdown — retrieve page as enhanced markdown."""
+    url = "https://api.notion.com/v1/pages/%s/markdown" % page_id
+    return _api_request_markdown(url, "GET")
+
+
+def api_replace_markdown(page_id, markdown_content, allow_deleting=True):
+    """PATCH /v1/pages/:page_id/markdown — replace entire page content."""
+    url = "https://api.notion.com/v1/pages/%s/markdown" % page_id
+    body = {
+        "type": "replace_content",
+        "replace_content": {
+            "new_str": markdown_content,
+            "allow_deleting_content": allow_deleting,
+        },
+    }
+    return _api_request_markdown(url, "PATCH", body)
+
+
+def _is_markdown_api_available(page_id):
+    """Probe whether the markdown API is available for this page."""
+    result = api_get_markdown(page_id)
+    if result and "markdown" in result:
+        return True
+    return False
+
+
+# ==========================================
 # File Upload API (requires Notion-Version >= 2026-03-11)
 # ==========================================
 
@@ -1790,7 +1875,18 @@ def _cmd_pull_db(db_path, dry_run=False):
     return True
 
 
-def cmd_pull(filepath, dry_run=False):
+def _pull_via_markdown_api(page_id):
+    """Pull page content using Enhanced Markdown API (preserves callouts, colors)."""
+    result = api_get_markdown(page_id)
+    if not result:
+        return None
+    md_text = result.get("markdown", "")
+    if not md_text and not result.get("truncated"):
+        return ""
+    return md_text
+
+
+def cmd_pull(filepath, dry_run=False, use_legacy=False):
     p = Path(filepath)
     if not p.exists():
         print("ERROR: File not found: %s" % filepath, flush=True)
@@ -1859,7 +1955,17 @@ def cmd_pull(filepath, dry_run=False):
     print("File: %s" % filepath, flush=True)
     print("Notion ID: %s" % notion_id, flush=True)
 
-    md = fetch_page_blocks_as_text(notion_id, page_dir=p.parent)
+    md = None
+    if not use_legacy:
+        print("  Trying Enhanced Markdown API...", flush=True)
+        md = _pull_via_markdown_api(notion_id)
+        if md is not None:
+            print("  Markdown API pull OK (%d chars)." % len(md), flush=True)
+        else:
+            print("  Markdown API unavailable — falling back to block API.", flush=True)
+
+    if md is None:
+        md = fetch_page_blocks_as_text(notion_id, page_dir=p.parent)
 
     # Resolve child links if tree cache available
     if CFG.tree_json.exists() and notion_path:
@@ -2732,7 +2838,27 @@ def _resolve_local_uploads(blocks, page_dir, dry_run=False):
     return resolved
 
 
-def cmd_push(filepath, dry_run=False, recursive=False):
+def _push_via_markdown_api(page_id, body, dry_run=False):
+    """Push page content using Enhanced Markdown API (single API call replace)."""
+    if dry_run:
+        print("=== Push DRY RUN (Markdown API) ===", flush=True)
+        print("Notion ID: %s" % page_id, flush=True)
+        lines = body.strip().split("\n")
+        print("Content: %d lines" % len(lines), flush=True)
+        print("\n(dry-run: no changes written to Notion)", flush=True)
+        return True
+
+    print("  Using Enhanced Markdown API (single-call replace)...", flush=True)
+    result = api_replace_markdown(page_id, body, allow_deleting=True)
+    if result and "markdown" in result:
+        print("  Markdown API push complete.", flush=True)
+        return True
+
+    print("  Markdown API push failed — falling back to block API.", flush=True)
+    return False
+
+
+def cmd_push(filepath, dry_run=False, recursive=False, use_legacy=False):
     p = Path(filepath)
     if not p.exists():
         print("ERROR: File not found: %s" % filepath, flush=True)
@@ -2817,6 +2943,29 @@ def cmd_push(filepath, dry_run=False, recursive=False):
     print("=== Push to Notion ===", flush=True)
     print("File: %s" % filepath, flush=True)
     print("Notion ID: %s" % notion_id, flush=True)
+
+    # Try Enhanced Markdown API for simple push (no wikilinks = no child page references)
+    if not use_legacy and not has_wikilinks:
+        md_ok = _push_via_markdown_api(notion_id, body, dry_run=False)
+        if md_ok:
+            now = datetime.now().isoformat()
+            fm["synced_at"] = now
+            fm["pushed_at"] = now
+            fm_lines = ["---"]
+            for k, v in fm.items():
+                fm_lines.append("%s: %s" % (k, v))
+            fm_lines.append("---")
+            p.write_text("\n".join(fm_lines) + "\n\n" + body, encoding="utf-8")
+
+            state = load_sync_state()
+            if notion_id in state.get("items", {}):
+                state["items"][notion_id]["synced_at"] = now
+                state["items"][notion_id]["pushed_at"] = now
+                state["items"][notion_id]["content_hash"] = _file_content_hash(p)
+                save_sync_state(state)
+            print("Push complete.", flush=True)
+            return True
+        print("Falling back to block API...", flush=True)
 
     existing = get_blocks(notion_id)
     child_blocks = [b for b in existing if b["type"] in ("child_page", "child_database")]
@@ -3706,6 +3855,18 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # Discover nsync.py
 NSYNC="${NSYNC_SCRIPT:-}"
 if [ -z "$NSYNC" ]; then
+  SEARCH="$DIR"
+  while [ -n "$SEARCH" ] && [ "$SEARCH" != "/" ]; do
+    if [ -f "$SEARCH/.claude/skills/nsync/scripts/nsync.py" ]; then
+      NSYNC="$SEARCH/.claude/skills/nsync/scripts/nsync.py"
+      break
+    fi
+    NEXT="$(dirname "$SEARCH")"
+    [ "$NEXT" = "$SEARCH" ] && break
+    SEARCH="$NEXT"
+  done
+fi
+if [ -z "$NSYNC" ]; then
   GIT_ROOT="$(git -C "$DIR" rev-parse --show-toplevel 2>/dev/null)"
   for candidate in \
     "${GIT_ROOT:-.}/.claude/skills/nsync/scripts/nsync.py" \
@@ -3809,14 +3970,15 @@ def main():
     elif command == "pull":
         dry_run = "--dry-run" in args
         recursive = "--recursive" in args or "-r" in args
-        pull_args = [a for a in args[1:] if a not in ("--dry-run", "--recursive", "-r")]
+        use_legacy = "--legacy" in args
+        pull_args = [a for a in args[1:] if a not in ("--dry-run", "--recursive", "-r", "--legacy")]
         if len(pull_args) < 1:
-            print("Usage: nsync.py pull [--dry-run] [--recursive|-r] <filepath.md|notion-url>", flush=True)
+            print("Usage: nsync.py pull [--dry-run] [--recursive|-r] [--legacy] <filepath.md|notion-url>", flush=True)
             sys.exit(1)
         if recursive:
             cmd_pull_recursive(pull_args[0], dry_run=dry_run)
         else:
-            cmd_pull(pull_args[0], dry_run=dry_run)
+            cmd_pull(pull_args[0], dry_run=dry_run, use_legacy=use_legacy)
     elif command == "new":
         new_args = [a for a in args[1:] if not a.startswith("--")]
         children_str = ""
@@ -3834,11 +3996,12 @@ def main():
     elif command == "push":
         dry_run = "--dry-run" in args
         recursive = "--recursive" in args or "-r" in args
-        push_args = [a for a in args[1:] if a not in ("--dry-run", "--recursive", "-r")]
+        use_legacy = "--legacy" in args
+        push_args = [a for a in args[1:] if a not in ("--dry-run", "--recursive", "-r", "--legacy")]
         if len(push_args) < 1:
-            print('Usage: nsync.py push [--dry-run] [--recursive|-r] <filepath.md>', flush=True)
+            print('Usage: nsync.py push [--dry-run] [--recursive|-r] [--legacy] <filepath.md>', flush=True)
             sys.exit(1)
-        cmd_push(push_args[0], dry_run=dry_run, recursive=recursive)
+        cmd_push(push_args[0], dry_run=dry_run, recursive=recursive, use_legacy=use_legacy)
     elif command == "query":
         if len(args) < 3:
             print('Usage: nsync.py query <db_name> "SELECT ..."', flush=True)
@@ -3867,8 +4030,10 @@ def print_usage():
     print("  sync --no-push     Skip local change detection & auto-push", flush=True)
     print("  pull <file>        Pull single file from Notion (.md or .db)", flush=True)
     print("  pull -r <url>      Recursively pull a subtree by Notion URL", flush=True)
+    print("  pull --legacy      Force block API (skip Markdown API)", flush=True)
     print("  push <file>        Push local file to Notion (.md or .db)", flush=True)
     print("  push -r <file>     Push recursively (create child pages too)", flush=True)
+    print("  push --legacy      Force block API (skip Markdown API)", flush=True)
     print('  new <parent> "Title" [--children "A,B,C"]  Scaffold new page', flush=True)
     print("  status             Show sync status", flush=True)
     print("  init-state         Init state from existing files", flush=True)
