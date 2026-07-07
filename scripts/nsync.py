@@ -278,6 +278,11 @@ def _api_request(url, method="GET", body_dict=None, retries=None):
                 print("  HTTP %d on attempt %d: %s" % (e.code, attempt + 1, url), flush=True)
                 if err_body:
                     print("  Response: %s" % err_body, flush=True)
+                # 4xx (validation errors etc.) won't succeed on retry — fail fast.
+                # Exceptions: 408/409 are transient per Notion API docs (429/404
+                # are handled above). 5xx server errors also retry.
+                if e.code < 500 and e.code not in (408, 409):
+                    return None
                 if attempt < retries - 1:
                     time.sleep(CFG.retry_backoff ** attempt)
                     continue
@@ -683,6 +688,14 @@ def rich_text_to_markdown(rt_list):
             text = "~~%s~~" % text
         if href:
             text = "[%s](%s)" % (text, href)
+        color = ann.get("color", "default")
+        if color and color != "default":
+            # Enhanced MD API syntax — round-trippable via push. Wrap per
+            # line: the push-side parser is line-based and a span crossing
+            # a newline would never match.
+            c = color.replace("_background", "_bg")
+            text = "\n".join('<span color="%s">%s</span>' % (c, ln) if ln else ln
+                             for ln in text.split("\n"))
 
         parts.append(text)
     return "".join(parts)
@@ -746,16 +759,49 @@ def _block_to_md(b, depth=0):
         mark = "x" if checked else " "
         md_line = indent + "- [%s] %s" % (mark, text)
     elif btype == "toggle":
-        md_line = indent + "- " + text
+        # Emit the Enhanced MD API syntax so toggles survive round-trip.
+        # Children must live inside the tags, so recurse here and return
+        # early instead of falling through to the shared child handling.
+        child_lines = []
+        if b.get("has_children") and depth < 3:
+            child_indent = "  " * (depth + 1)
+            in_fence = False
+            for child in _get_child_blocks(b["id"]):
+                for _, centry in _block_to_md(child, depth + 1):
+                    for ln in centry.split("\n"):
+                        # Drop the depth indent — the tag scope already
+                        # nests the content; keeping it would accumulate
+                        # spaces on every pull/push cycle. Never touch
+                        # code-fence content (leading spaces are code).
+                        if ln.startswith("```"):
+                            in_fence = not in_fence
+                        elif not in_fence and ln.startswith(child_indent):
+                            ln = ln[len(child_indent):]
+                        child_lines.append("\t" + ln)
+        inner = ("\n" + "\n".join(child_lines)) if child_lines else ""
+        summary = text.replace("\n", "<br>")
+        md_line = "<details>\n<summary>%s</summary>%s\n</details>" % (summary, inner)
+        return [(btype, md_line)]
     elif btype == "code":
         lang = block_data.get("language", "")
         md_line = "```%s\n%s\n```" % (lang, plain)
     elif btype == "quote":
         md_line = "> " + text
     elif btype == "callout":
+        # Emit the Notion Enhanced Markdown API syntax so callouts survive
+        # a pull -> push round-trip (both the MD API and our block-API
+        # parser understand it). Legacy '> emoji text' stays quote-only.
         icon = b.get(btype, {}).get("icon") or {}
         emoji = icon.get("emoji", "") if icon.get("type") == "emoji" else ""
-        md_line = "> %s %s" % (emoji, text)
+        color = block_data.get("color", "default")
+        attrs = []
+        if emoji:
+            attrs.append('icon="%s"' % emoji)
+        if color and color != "default":
+            attrs.append('color="%s"' % color.replace("_background", "_bg"))
+        attr_str = (" " + " ".join(attrs)) if attrs else ""
+        body_text = "\n".join("\t" + ln for ln in text.split("\n"))
+        md_line = "<callout%s>\n%s\n</callout>" % (attr_str, body_text)
     elif btype == "divider":
         md_line = "---"
     elif btype == "image":
@@ -1556,7 +1602,12 @@ def parse_front_matter(text):
     for line in parts[1].strip().split("\n"):
         if ":" in line:
             key, val = line.split(":", 1)
-            fm[key.strip()] = val.strip()
+            val = val.strip()
+            # Strip surrounding quotes (same behavior as _parse_simple_yaml).
+            # Quoted UUIDs in notion_parent/notion_id caused HTTP 400 otherwise.
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                val = val[1:-1]
+            fm[key.strip()] = val
     return fm, parts[2].strip()
 
 
@@ -1575,16 +1626,70 @@ def _normalize_lang(lang):
     return _LANG_ALIASES.get(low, low)
 
 
+_URL_SCHEME_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9+.\-]*:')
+
+
+def _resolve_schemeless_link(link_url, from_angle):
+    """Decide what to do with a schemeless link URL before pushing to Notion.
+
+    Returns the URL to send, or None to render the link as plain text.
+    - Scheme URLs (http/https/mailto/...) pass through unchanged.
+    - Anchors (#...) are rejected by the Notion API -> textize.
+    - Angle-bracket relative paths (nsync generates these on pull for paths
+      with spaces/parens) are rejected as-is -> resolve via tree_cache to a
+      notion.so URL, else textize. Plain relative paths are currently
+      accepted by the API and pass through unchanged.
+    """
+    if _URL_SCHEME_RE.match(link_url):
+        return link_url
+    if link_url.startswith("#"):
+        print("  Link textized (anchor not supported by Notion API): %s" % link_url, flush=True)
+        return None
+    if not from_angle:
+        return link_url
+    # Angle-bracket relative path: try to resolve to a Notion page URL
+    try:
+        from urllib.parse import unquote
+        rel = unquote(link_url)
+        stem = Path(rel).stem
+        matches = [t for t in _load_tree_cache()
+                   if t.get("title", "") == stem or sanitize_filename(t.get("title", "")) == stem]
+        if len(matches) > 1:
+            # Same title exists in multiple folders: disambiguate by the
+            # link's parent directory vs the item's Notion-side parent title.
+            parent_dir = Path(rel).parent.name
+            if parent_dir and parent_dir != ".":
+                narrowed = [t for t in matches
+                            if len(t.get("path", "").split("/")) >= 2
+                            and sanitize_filename(t["path"].split("/")[-2]) == parent_dir]
+                if len(narrowed) == 1:
+                    matches = narrowed
+        if len(matches) == 1:
+            t_item = matches[0]
+            resolved = "https://www.notion.so/" + t_item["id"].replace("-", "")
+            print("  Link resolved to Notion page: %s -> %s" % (link_url, t_item.get("title")), flush=True)
+            return resolved
+        if len(matches) > 1:
+            print("  Link textized (ambiguous: title '%s' matches %d pages): %s" % (
+                stem, len(matches), link_url), flush=True)
+            return None
+    except Exception:
+        pass
+    print("  Link textized (unresolvable relative path): %s" % link_url, flush=True)
+    return None
+
+
 def parse_inline_markdown(text):
     """Convert Markdown inline formatting to Notion rich_text segments."""
     segments = []
     _INLINE_RE = re.compile(
-        r'(?P<bold_italic>\*\*\*(.+?)\*\*\*)'
-        r'|(?P<bold>\*\*(.+?)\*\*)'
-        r'|(?P<italic>\*(.+?)\*)'
-        r'|(?P<strike>~~(.+?)~~)'
-        r'|(?P<code>`([^`]+)`)'
-        r'|(?P<link>\[([^\]]+)\]\(([^)]+)\))'
+        r'(?P<span><span color="(?P<scolor>[^"]*)">(?P<stext>.*?)</span>)'
+        r'|(?P<bold_italic>\*\*\*(?P<bitext>.+?)\*\*\*)'
+        r'|(?P<bold>\*\*(?P<btext>.+?)\*\*)'
+        r'|(?P<italic>\*(?P<itext>.+?)\*)'
+        r'|(?P<strike>~~(?P<sttext>.+?)~~)'
+        r'|(?P<code>`(?P<ctext>[^`]+)`)'
+        r'|(?P<link>\[(?P<ltext>[^\]]+)\]\((?:<(?P<langle>[^>]+)>|(?P<lplain>[^)]+))\))'
         r'|(?P<img>!\[([^\]]*)\]\(([^)]+)\))'
     )
 
@@ -1595,25 +1700,49 @@ def parse_inline_markdown(text):
             if plain:
                 segments.extend(_chunk_text(plain, {}))
 
-        if m.group("bold_italic"):
-            segments.extend(_chunk_text(m.group(2), {"bold": True, "italic": True}))
+        if m.group("span"):
+            # Enhanced MD API color syntax: recurse for inner formatting,
+            # then stamp the color annotation on every produced segment.
+            color_val = m.group("scolor")
+            if color_val.endswith("_bg"):
+                color_val = color_val[:-3] + "_background"
+            inner_segments = parse_inline_markdown(m.group("stext"))
+            if color_val in _CALLOUT_COLORS and color_val != "default":
+                for seg in inner_segments:
+                    seg.setdefault("annotations", {})["color"] = color_val
+            elif color_val:
+                print("  ⚠ Invalid span color %r — dropped." % m.group("scolor"), flush=True)
+            segments.extend(inner_segments)
+        elif m.group("bold_italic"):
+            segments.extend(_chunk_text(m.group("bitext"), {"bold": True, "italic": True}))
         elif m.group("bold"):
-            segments.extend(_chunk_text(m.group(4), {"bold": True}))
+            segments.extend(_chunk_text(m.group("btext"), {"bold": True}))
         elif m.group("italic"):
-            segments.extend(_chunk_text(m.group(6), {"italic": True}))
+            segments.extend(_chunk_text(m.group("itext"), {"italic": True}))
         elif m.group("strike"):
-            segments.extend(_chunk_text(m.group(8), {"strikethrough": True}))
+            segments.extend(_chunk_text(m.group("sttext"), {"strikethrough": True}))
         elif m.group("code"):
-            segments.extend(_chunk_text(m.group(10), {"code": True}))
+            segments.extend(_chunk_text(m.group("ctext"), {"code": True}))
         elif m.group("img"):
             pass
         elif m.group("link"):
-            link_text = m.group(12)
-            link_url = m.group(13)
-            segments.append({
-                "type": "text",
-                "text": {"content": link_text, "link": {"url": link_url}}
-            })
+            link_text = m.group("ltext")
+            angle_url = m.group("langle")
+            link_url = angle_url if angle_url is not None else m.group("lplain")
+            resolved = _resolve_schemeless_link(link_url, from_angle=angle_url is not None)
+            if resolved is None:
+                # Keep the target visible for path links so the information
+                # survives a later pull overwriting the local file. Anchors
+                # keep just the text (they point within the same page).
+                if link_url.startswith("#"):
+                    segments.extend(_chunk_text(link_text, {}))
+                else:
+                    segments.extend(_chunk_text("%s (%s)" % (link_text, link_url), {}))
+            else:
+                segments.append({
+                    "type": "text",
+                    "text": {"content": link_text, "link": {"url": resolved}}
+                })
         pos = m.end()
 
     if pos < len(text):
@@ -1646,6 +1775,14 @@ def _img_re_match(line):
         return m.group(1), m.group(2)
     return None, None
 
+
+_CALLOUT_COLORS = {
+    "default", "gray", "brown", "orange", "yellow", "green", "blue",
+    "purple", "pink", "red",
+    "gray_background", "brown_background", "orange_background",
+    "yellow_background", "green_background", "blue_background",
+    "purple_background", "pink_background", "red_background",
+}
 
 _WIKILINK_RE = re.compile('^\[\[(\U0001f4c4|\U0001f5c3\ufe0f)\s+(.+)\]\]$')
 _CHILD_LINK_RE = re.compile('^\[(\U0001f4c4|\U0001f5c3\ufe0f)\s+(.+?)\]\(<?(.+?)>?\)$')
@@ -1718,6 +1855,112 @@ def markdown_to_notion_blocks(md_text):
                 "object": "block", "type": "code",
                 "code": {"rich_text": rt, "language": lang}
             })
+        elif line.startswith("<callout"):
+            # Enhanced MD API callout syntax: <callout icon=".." color="..">
+            #   (tab-indented content lines)
+            # </callout>
+            # Also accepts the one-line form <callout ..>text</callout>.
+            stripped_line = line.strip()
+            m_inline = re.match(r'^<callout([^>]*)>(.+)</callout>\s*$', stripped_line)
+            m_open = re.match(r'^<callout([^>]*)>\s*$', stripped_line)
+            attr_text = None
+            content_lines = None
+            if m_inline:
+                attr_text = m_inline.group(1)
+                content_lines = [m_inline.group(2)]
+            elif m_open:
+                # Scan ahead for the matching close tag (depth-aware for
+                # nested callouts). Never swallow the document on a missing
+                # close tag — fall back to plain text instead.
+                depth = 1
+                end = None
+                for j in range(i + 1, len(lines)):
+                    st = lines[j].strip()
+                    if re.match(r'^<callout([^>]*)>\s*$', st):
+                        depth += 1
+                    elif st == "</callout>":
+                        depth -= 1
+                        if depth == 0:
+                            end = j
+                            break
+                if end is None:
+                    print("  ⚠ Unclosed <callout> — kept as plain text.", flush=True)
+                else:
+                    attr_text = m_open.group(1)
+                    content_lines = [lines[k][1:] if lines[k].startswith("\t")
+                                     else lines[k].strip()
+                                     for k in range(i + 1, end)]
+                    i = end
+            if content_lines is None:
+                # Invalid/unclosed syntax: keep the line as a paragraph.
+                blocks.append({"object": "block", "type": "paragraph",
+                    "paragraph": {"rich_text": parse_inline_markdown(line)}})
+            else:
+                m_icon = re.search(r'icon="([^"]*)"', attr_text)
+                m_color = re.search(r'color="([^"]*)"', attr_text)
+                content_text = "\n".join(content_lines).replace("<br>", "\n")
+                callout_obj = {"rich_text": parse_inline_markdown(content_text)}
+                icon_val = m_icon.group(1) if m_icon else ""
+                if icon_val and not all(ord(c) < 128 for c in icon_val):
+                    callout_obj["icon"] = {"type": "emoji", "emoji": icon_val}
+                elif icon_val:
+                    print("  ⚠ Invalid callout icon %r — dropped (emoji required)." % icon_val, flush=True)
+                if m_color and m_color.group(1):
+                    color_val = m_color.group(1)
+                    if color_val.endswith("_bg"):
+                        color_val = color_val[:-3] + "_background"
+                    if color_val in _CALLOUT_COLORS:
+                        callout_obj["color"] = color_val
+                    else:
+                        print("  ⚠ Invalid callout color %r — dropped." % color_val, flush=True)
+                blocks.append({"object": "block", "type": "callout", "callout": callout_obj})
+        elif line.strip().startswith("<details"):
+            # Enhanced MD API toggle syntax:
+            # <details>
+            # <summary>title</summary>
+            #   (tab-indented child lines)
+            # </details>
+            depth = 1
+            end = None
+            for j in range(i + 1, len(lines)):
+                st = lines[j].strip()
+                if st.startswith("<details"):
+                    depth += 1
+                elif st == "</details>":
+                    depth -= 1
+                    if depth == 0:
+                        end = j
+                        break
+            if end is None:
+                print("  ⚠ Unclosed <details> — kept as plain text.", flush=True)
+                blocks.append({"object": "block", "type": "paragraph",
+                    "paragraph": {"rich_text": parse_inline_markdown(line)}})
+            else:
+                summary_text = ""
+                inner_lines = []
+                for k in range(i + 1, end):
+                    raw = lines[k]
+                    st = raw.strip()
+                    m_sum = re.match(r'^<summary>(.*)</summary>\s*$', st)
+                    if m_sum and not summary_text:
+                        summary_text = m_sum.group(1).replace("<br>", "\n")
+                        continue
+                    inner_lines.append(raw[1:] if raw.startswith("\t") else raw)
+                # Recurse so nested toggles/callouts/lists/code keep their
+                # structure instead of degrading to literal paragraphs.
+                child_blocks = []
+                if any(ln.strip() for ln in inner_lines):
+                    child_blocks = [cb for cb in markdown_to_notion_blocks("\n".join(inner_lines))
+                                    if not cb.get("_wikilink")]
+                if len(child_blocks) > 100:
+                    print("  ⚠ Toggle has %d children — only the first 100 are kept "
+                          "(Notion API limit)." % len(child_blocks), flush=True)
+                    child_blocks = child_blocks[:100]
+                toggle_obj = {"rich_text": parse_inline_markdown(summary_text or " ")}
+                if child_blocks:
+                    toggle_obj["children"] = child_blocks
+                blocks.append({"object": "block", "type": "toggle", "toggle": toggle_obj})
+                i = end
         elif line.startswith("###### "):
             # H6 → styled paragraph (▹ bold)
             htext = line[7:]
@@ -2428,6 +2671,43 @@ def _find_children_in_md(md_text, page_dir):
     return children
 
 
+_MD_LINK_RE_ANY = re.compile(r'\[([^\]]+)\]\((?:<([^>]+)>|([^)]+))\)')
+
+
+def _find_undetected_md_links(md_text):
+    """Find inline links to .md files that are NOT icon-format child links.
+
+    Child pages are only auto-created by push -r when referenced as
+    '[📄 Title](path)' on their own line; plain links to .md files are
+    silently treated as body links. Surface them so users can fix the format.
+    Returns [(link_text, target), ...].
+    """
+    results = []
+    in_fence = False
+    for line in md_text.split("\n"):
+        stripped = line.strip()
+        # Column-0 fences only, matching markdown_to_notion_blocks — a
+        # tab-indented ``` inside a <callout> body must not toggle state.
+        if line.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if _CHILD_LINK_RE.match(stripped):
+            continue
+        for m in _MD_LINK_RE_ANY.finditer(line):
+            text = m.group(1)
+            target = (m.group(2) or m.group(3) or "").strip()
+            # Media links are a separate feature (block-level upload); icon
+            # child links NOT on their own line are exactly the confusing
+            # case, so they are kept in the warning list.
+            if text.startswith(("📎", "🎬", "🔊", "📁")):
+                continue
+            if target.lower().endswith(".md") and not _URL_SCHEME_RE.match(target):
+                results.append((text, target))
+    return results
+
+
 def _validate_push_structure(filepath, recursive=False):
     """Validate structure before push. Returns (errors, warnings)."""
     errors = []
@@ -2467,6 +2747,13 @@ def _validate_push_structure(filepath, recursive=False):
         for t_item in tree:
             if t_item.get("title") == title:
                 warnings.append("DUPLICATE: A page named '%s' already exists on Notion (id: %s). Will be skipped." % (title, t_item["id"][:8]))
+
+    # Warn about .md links that won't be picked up as child pages
+    if recursive:
+        for link_text, target in _find_undetected_md_links(body):
+            warnings.append(
+                "NOT A CHILD LINK: [%s](%s) — push -r only auto-creates children "
+                "referenced as '[📄 Title](path)' on their own line." % (link_text, target))
 
     return errors, warnings
 
@@ -2585,6 +2872,9 @@ def cmd_push_new(filepath, dry_run=False, recursive=False):
 
     # Recursive: create child pages
     if recursive:
+        for link_text, target in _find_undetected_md_links(body):
+            print("  ⚠ NOT A CHILD LINK: [%s](%s) — use '[📄 Title](path)' format "
+                  "to auto-create as child page." % (link_text, target), flush=True)
         children = _find_children_in_md(body, p.parent)
         if children:
             print("Processing %d child references..." % len(children), flush=True)
@@ -3082,6 +3372,9 @@ def cmd_push(filepath, dry_run=False, recursive=False, use_legacy=False):
 
     # Recursive: process child page links that don't have notion_id yet
     if recursive:
+        for link_text, target in _find_undetected_md_links(body):
+            print("  ⚠ NOT A CHILD LINK: [%s](%s) — use '[📄 Title](path)' format "
+                  "to auto-create as child page." % (link_text, target), flush=True)
         children = _find_children_in_md(body, p.parent)
         new_children = []
         for child_title, child_type, child_fp in children:
