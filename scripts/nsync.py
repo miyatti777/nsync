@@ -182,6 +182,57 @@ def extract_page_id_from_url(url):
     return ""
 
 
+_TREE_PAGE_IDS = None  # module cache: set of dashless in-tree page IDs (from tree_cache.json)
+
+
+def _tree_page_id_set():
+    """Set of page IDs (dashless) present in the current workspace tree cache.
+
+    Used on push to decide whether a Notion page link should be emitted as a page *mention*
+    instead of a plain link: in-tree references remap to the copy when a page tree is
+    duplicated in Notion, whereas plain hyperlinks keep pointing at the original (which a
+    person who duplicated the tree cannot access). Returns an empty set when no cache exists,
+    so behaviour falls back to plain links. (B1 fix — clone-safety)
+    """
+    global _TREE_PAGE_IDS
+    if _TREE_PAGE_IDS is not None:
+        return _TREE_PAGE_IDS
+    ids = set()
+    try:
+        tj = getattr(CFG, "tree_json", None)
+        if tj and Path(tj).exists():
+            data = json.loads(Path(tj).read_text(encoding="utf-8"))
+            nodes = data if isinstance(data, list) else data.get("items", [])
+            for n in nodes:
+                # Only real pages: a page mention with a database id is rejected by Notion
+                # and aborts the whole block batch, so links to in-tree databases must stay
+                # plain links. (B1 fix — clone-safety)
+                if n.get("type") != "page":
+                    continue
+                nid = (n.get("id") or "").replace("-", "")
+                if nid:
+                    ids.add(nid)
+    except Exception:
+        ids = set()
+    _TREE_PAGE_IDS = ids
+    return ids
+
+
+def _body_has_intree_page_link(body):
+    """True if the markdown body contains a plain link to an in-tree Notion page.
+
+    Such pages must take the block-API push path so the link→mention rewrite in
+    parse_inline_markdown actually runs; the Enhanced-Markdown fast-path pushes the raw
+    string and would leave the reference a plain link (which breaks on Notion Duplicate).
+    (B1 fix — clone-safety)
+    """
+    for m in re.finditer(r'\]\(\s*<?(https?://[^)>\s]+)', body):
+        pid = extract_page_id_from_url(m.group(1))
+        if pid and pid.replace("-", "") in _tree_page_id_set():
+            return True
+    return False
+
+
 # ==========================================
 # Crash Detection & Heartbeat
 # ==========================================
@@ -1739,10 +1790,21 @@ def parse_inline_markdown(text):
                 else:
                     segments.extend(_chunk_text("%s (%s)" % (link_text, link_url), {}))
             else:
-                segments.append({
-                    "type": "text",
-                    "text": {"content": link_text, "link": {"url": resolved}}
-                })
+                # In-tree Notion page link → emit a page mention so the reference survives
+                # Notion "Duplicate" (mentions remap to the copy; plain links do not). Links
+                # to pages outside this tree (external URLs, other workspaces) stay as plain
+                # links. (B1 fix — clone-safety)
+                _pid = extract_page_id_from_url(resolved)
+                if _pid and _pid.replace("-", "") in _tree_page_id_set():
+                    segments.append({
+                        "type": "mention",
+                        "mention": {"type": "page", "page": {"id": _pid}},
+                    })
+                else:
+                    segments.append({
+                        "type": "text",
+                        "text": {"content": link_text, "link": {"url": resolved}}
+                    })
         pos = m.end()
 
     if pos < len(text):
@@ -3128,8 +3190,41 @@ def _resolve_local_uploads(blocks, page_dir, dry_run=False):
     return resolved
 
 
+_BARE_MD_RE = re.compile(
+    r'(?P<code>`[^`]*`)'
+    r'|(?P<link>!?\[[^\]]*\]\(\s*<?[^)]*\))'
+    r'|(?P<bare>(?<![\w/`.\-])[A-Za-z0-9][\w-]*\.md)(?![\w`)])'
+)
+
+
+def _escape_bare_md_links(body):
+    """Wrap bare `word.md` filenames in backticks so the Notion Enhanced-Markdown API does not
+    auto-link them as http://word.md (`.md` is a ccTLD). Fenced code blocks, inline code spans,
+    and markdown link/image targets are left untouched — the alternation consumes those first,
+    so only truly bare filenames are wrapped. (B4 fix — clone-safety)
+    """
+    def _sub(m):
+        if m.lastgroup == "bare":
+            return "`%s`" % m.group("bare")
+        return m.group(0)
+    out = []
+    in_fence = False
+    for line in body.split("\n"):
+        stripped = line.lstrip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        if in_fence:
+            out.append(line)
+            continue
+        out.append(_BARE_MD_RE.sub(_sub, line))
+    return "\n".join(out)
+
+
 def _push_via_markdown_api(page_id, body, dry_run=False):
     """Push page content using Enhanced Markdown API (single API call replace)."""
+    body = _escape_bare_md_links(body)
     if dry_run:
         print("=== Push DRY RUN (Markdown API) ===", flush=True)
         print("Notion ID: %s" % page_id, flush=True)
@@ -3139,7 +3234,11 @@ def _push_via_markdown_api(page_id, body, dry_run=False):
         return True
 
     print("  Using Enhanced Markdown API (single-call replace)...", flush=True)
-    result = api_replace_markdown(page_id, body, allow_deleting=True)
+    # Defense in depth: never allow the markdown replace to delete child pages/databases.
+    # cmd_push already routes child-bearing pages to the block API, so this path should only
+    # run on child-free pages; keep allow_deleting False so a missed detection can't trash a
+    # subtree. (B2 fix — clone-safety)
+    result = api_replace_markdown(page_id, body, allow_deleting=False)
     if result and "markdown" in result:
         print("  Markdown API push complete.", flush=True)
         return True
@@ -3190,6 +3289,23 @@ def cmd_push(filepath, dry_run=False, recursive=False, use_legacy=False):
     new_blocks = _resolve_local_uploads(new_blocks, p.parent, dry_run)
     has_wikilinks = any(blk.get("_wikilink") for blk in new_blocks)
 
+    # Detect child pages/databases (including nested under toggles/callouts) BEFORE choosing
+    # the push path. The Enhanced Markdown API replace path (_push_via_markdown_api) deletes
+    # any child page not present in the new content — trashing whole subtrees. Pages that
+    # contain child pages must therefore use the block-API path, where _safe_delete_blocks
+    # skips child-bearing blocks and preserves them. (B2 fix — clone-safety)
+    existing = get_blocks(notion_id)
+    # The nested scan (_has_nested_child_pages crawls each container subtree) is only needed
+    # to decide whether the destructive markdown fast-path is safe. When we already know we
+    # will take the block-API path (--legacy or wikilinks present), skip the crawl entirely.
+    has_child_content = False
+    if not use_legacy and not has_wikilinks:
+        has_child_content = any(
+            b.get("type") in ("child_page", "child_database")
+            or (b.get("has_children") and _has_nested_child_pages(b))
+            for b in existing
+        )
+
     if dry_run:
         print("=== Push DRY RUN ===", flush=True)
         print("File: %s" % filepath, flush=True)
@@ -3199,6 +3315,8 @@ def cmd_push(filepath, dry_run=False, recursive=False, use_legacy=False):
         if has_wikilinks:
             wl_count = sum(1 for b in new_blocks if b.get("_wikilink"))
             print("Child references (preserved): %d" % wl_count, flush=True)
+        if has_child_content:
+            print("Child pages/databases detected → block API (safe: children preserved)", flush=True)
 
         # Structure validation
         if recursive:
@@ -3234,8 +3352,12 @@ def cmd_push(filepath, dry_run=False, recursive=False, use_legacy=False):
     print("File: %s" % filepath, flush=True)
     print("Notion ID: %s" % notion_id, flush=True)
 
-    # Try Enhanced Markdown API for simple push (no wikilinks = no child page references)
-    if not use_legacy and not has_wikilinks:
+    # Try Enhanced Markdown API for simple push (no wikilinks, no child pages, no in-tree
+    # page links). Child pages would be trashed by its replace (B2); in-tree page links must
+    # go through the block API so parse_inline_markdown rewrites them to mentions (B1) —
+    # the fast-path pushes the raw string and would leave them as clone-breaking plain links.
+    if (not use_legacy and not has_wikilinks and not has_child_content
+            and not _body_has_intree_page_link(body)):
         md_ok = _push_via_markdown_api(notion_id, body, dry_run=False)
         if md_ok:
             now = datetime.now().isoformat()
@@ -3257,7 +3379,7 @@ def cmd_push(filepath, dry_run=False, recursive=False, use_legacy=False):
             return True
         print("Falling back to block API...", flush=True)
 
-    existing = get_blocks(notion_id)
+    # `existing` was fetched above (child-content detection); reuse it here.
     child_blocks = [b for b in existing if b["type"] in ("child_page", "child_database")]
     non_child_blocks = [b for b in existing if b["type"] not in ("child_page", "child_database")]
 
