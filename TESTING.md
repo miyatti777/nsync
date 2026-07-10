@@ -24,7 +24,7 @@ python3 -m unittest discover tests        # リポジトリルートから
 - [ ] ローカルMDを1行編集 → `sync` → Notionに反映され、他ページは再DLされない（差分同期）
 - [ ] `sync --dry-run` → 変更検出のみで書き込みなし
 
-### 2. 装飾round-trip（2026-07 L-0707で追加）
+### 2. 装飾round-trip（2026-07追加）
 
 - [ ] Notionでcallout（絵文字icon+背景色）を作成 → `pull` → ローカルMDに `<callout icon=".." color="..">` が出る
 - [ ] そのまま `push` → Notion側でcalloutのまま（**quoteに劣化しない**）。icon・背景色維持

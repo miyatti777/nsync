@@ -170,7 +170,7 @@ exclude_paths:
 Cursorのチャットで自然言語で依頼できます:
 
 ```
-「NotionのPalmaページをローカルに同期して」
+「NotionのMy Projectページをローカルに同期して」
 → nsync init + sync を実行
 
 「Notion同期して」「nsync sync」
@@ -190,7 +190,7 @@ Cursorのチャットで自然言語で依頼できます:
 
 ```bash
 # Claude Code のプロンプトから
-claude "nsync で Palma を同期して"
+claude "nsync で My Project を同期して"
 claude "Product Backlog から優先度高のタスクを検索して"
 ```
 
@@ -218,7 +218,7 @@ cd projects/my-project
 ./nsync.sh new "https://www.notion.so/xxx/Parent-xxx" "企画書" --children "調査メモ,スケジュール,議事録"
 
 # 親をtree_cacheのページ名で指定することも可能
-./nsync.sh new "Palma" "新ページ"
+./nsync.sh new "My Project" "新ページ"
 ```
 
 生成される構造:
@@ -260,7 +260,7 @@ cd projects/my-project
 
 ```yaml
 ---
-notion_parent: 299b1337-01be-8077-807d-f97d164b62b3
+notion_parent: 12345678-1234-1234-1234-1234567890ab
 title: 企画書
 ---
 ```
