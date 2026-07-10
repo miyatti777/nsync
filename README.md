@@ -14,6 +14,8 @@
 - **New Page Creation**: ローカルでページ構造を作成→Notionに一括反映（scaffold + recursive push）
 - **Claude Skill**: AIアシスタント（Claude / Cursor）から直接呼び出し可能
 
+> 📖 **運用ガイド:** [Notion × Claude Code 往復ワークフロー](docs/roundtrip-workflow.md) — 戦略・企画は Notion、実装・執筆は Claude Code で行き来する循環ワークフローの方法論
+
 ## インストール
 
 ### Claude Skill として使う場合（推奨）
