@@ -2,6 +2,8 @@
 
 任意のNotionページ配下をローカルにミラーリングし、差分同期・Push・SQLiteクエリを行う汎用ツール。
 
+> ⚠️ **安全ガイド:** push の全置換の考え方・dry-run 推奨フロー・競合（CONFLICT）解決手順は [README「⚠️ Safety — 安全に使う」](README.md#%EF%B8%8F-safety--安全に使う) を参照。
+
 ## When to Use
 
 - Notionワークスペースの一部をローカルにCloneしたいとき
@@ -148,7 +150,7 @@ Notion のインライン装飾を正しくMarkdownに変換:
 | code | フェンスドコードブロック |
 | quote | `> text` |
 | callout | `<callout icon="🏷️" color="orange_bg">` 〜 `</callout>`（icon・背景色を保持、Push時に完全復元） |
-| toggle | `<details><summary>見出し</summary>` 〜 `</details>`（子ブロックをタブ字下げで内包、Push時に復元） |
+| toggle | `<details>` / `<summary>見出し</summary>` を別行で記述 〜 `</details>`（子ブロックをタブ字下げで内包、Push時に復元。1行にまとめた形式は不可） |
 | 色付きテキスト | `<span color="red">text</span>`（文字色・背景色を保持、Push時に復元） |
 | divider | `---` |
 | image | `![caption](_assets/file.png)` — 内部画像は自動DL |
@@ -210,7 +212,7 @@ Pull時に出力される装飾構文（Notion Enhanced Markdown APIと同一）
 | 構文 | 復元されるブロック |
 |------|------------------|
 | `<callout icon="🏷️" color="orange_bg">` 〜 `</callout>` | callout（icon・背景色付き） |
-| `<details><summary>見出し</summary>` 〜 `</details>` | toggle（タブ字下げの中身はリスト・コード等の構造ごと復元） |
+| `<details>` / `<summary>見出し</summary>`（別行） 〜 `</details>` | toggle（タブ字下げの中身はリスト・コード等の構造ごと復元。1行にまとめた形式は不可） |
 | `<span color="red">text</span>` | 文字色/背景色（`red` / `yellow_bg` 等。`_bg`=背景色） |
 
 - **旧形式は変換しない**: `> 絵文字 テキスト` はquoteのまま、`- テキスト` はリストのままPushされる（過去にPullしたファイルは従来挙動で安全）
