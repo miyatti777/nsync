@@ -3,7 +3,7 @@
 # Run:  python3 -m unittest discover tests        (from the repo root)
 #  or:  python3 -m pytest tests                   (if pytest is installed)
 #
-# Covers the regressions fixed in 2026-07 (L-0707):
+# Covers the regressions fixed in 2026-07:
 #   - front matter quote stripping
 #   - inline link handling (anchors, angle-bracket paths, tree_cache resolution)
 #   - callout / toggle / span decoration round-trip syntax
@@ -283,6 +283,112 @@ class TestUndetectedChildLinks(unittest.TestCase):
         r = ns._find_undetected_md_links(
             "[ext](https://a.com/b.md)\n[📎 file](_assets/f.pdf)")
         self.assertEqual(r, [])
+
+
+class WorkspaceFixture(unittest.TestCase):
+    """Temp workspace with tree_cache + sync_state and CFG paths pointed at it."""
+
+    ROOT_ID = "f" * 32
+    PARENT_ID = "a" * 32
+    TREE = [
+        {"type": "page", "title": "Root", "path": "Root",
+         "id": ROOT_ID, "depth": -1, "has_children": True, "is_root": True},
+        {"type": "page", "title": "Parent", "path": "Parent",
+         "id": PARENT_ID, "depth": 0, "has_children": True},
+        {"type": "page", "title": "Sub", "path": "Parent/Sub",
+         "id": "b" * 32, "depth": 1, "has_children": False},
+    ]
+
+    def setUp(self):
+        self.ws = Path(tempfile.mkdtemp(prefix="nsync-test-ws-"))
+        sync_dir = self.ws / "_nsync"
+        sync_dir.mkdir()
+        (sync_dir / "tree_cache.json").write_text(json.dumps(self.TREE))
+        self._old = (ns.CFG.sync_dir, ns.CFG.base_output_dir,
+                     ns.CFG.tree_json, ns.CFG.sync_state_json)
+        ns.CFG.sync_dir = sync_dir
+        ns.CFG.base_output_dir = self.ws
+        ns.CFG.tree_json = sync_dir / "tree_cache.json"
+        ns.CFG.sync_state_json = sync_dir / "sync_state.json"
+
+    def tearDown(self):
+        (ns.CFG.sync_dir, ns.CFG.base_output_dir,
+         ns.CFG.tree_json, ns.CFG.sync_state_json) = self._old
+        shutil.rmtree(self.ws, ignore_errors=True)
+
+
+class TestScaffoldCanonicalPath(WorkspaceFixture):
+    def test_new_under_parent_folder(self):
+        ok = _quiet(ns.cmd_new, "Parent", "Child")
+        self.assertTrue(ok)
+        page = self.ws / "Parent" / "Child.md"
+        self.assertTrue(page.exists())
+        self.assertFalse((self.ws / "Child.md").exists())
+        fm, _ = ns.parse_front_matter(page.read_text(encoding="utf-8"))
+        self.assertEqual(fm.get("notion_parent"), self.PARENT_ID)
+
+    def test_new_container_with_children_under_parent(self):
+        ok = _quiet(ns.cmd_new, "Parent", "Plan", children=["MemoA"])
+        self.assertTrue(ok)
+        self.assertTrue((self.ws / "Parent" / "Plan" / "Plan.md").exists())
+        # Children scaffold in flat form — the canonical path item_to_filepath
+        # resolves a childless page to (container form would duplicate on sync)
+        self.assertTrue((self.ws / "Parent" / "Plan" / "MemoA.md").exists())
+        self.assertFalse((self.ws / "Parent" / "Plan" / "MemoA" / "MemoA.md").exists())
+        # Parent body links to the flat path
+        body = (self.ws / "Parent" / "Plan" / "Plan.md").read_text(encoding="utf-8")
+        self.assertIn("(MemoA.md)", body)
+
+    def test_new_root_parent_scaffolds_at_ws_root(self):
+        ok = _quiet(ns.cmd_new, "Root", "TopPage")
+        self.assertTrue(ok)
+        self.assertTrue((self.ws / "TopPage.md").exists())
+
+    def test_new_unknown_parent_falls_back_to_ws_root(self):
+        url = "https://www.notion.so/x/Page-" + "9" * 32
+        ok = _quiet(ns.cmd_new, url, "Orphan")
+        self.assertTrue(ok)
+        self.assertTrue((self.ws / "Orphan.md").exists())
+
+    def test_new_local_file_parent_not_in_tree(self):
+        doc = self.ws / "Some" / "Doc.md"
+        doc.parent.mkdir(parents=True)
+        doc.write_text("---\nnotion_id: %s\n---\n\nbody\n" % ("9" * 32),
+                       encoding="utf-8")
+        ok = _quiet(ns.cmd_new, str(doc), "Child")
+        self.assertTrue(ok)
+        self.assertTrue((self.ws / "Some" / "Doc" / "Child.md").exists())
+
+
+class TestDuplicateNotionIdGuard(WorkspaceFixture):
+    DASHED = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+
+    def _write(self, relpath, notion_id):
+        fp = self.ws / relpath
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text("---\nnotion_id: %s\n---\n\nbody\n" % notion_id,
+                      encoding="utf-8")
+        return fp
+
+    def test_detect_duplicate_notion_ids(self):
+        self._write("Parent/Child.md", self.DASHED)
+        self._write("Child.md", "c" * 32)  # same id, dashless form
+        self._write("Parent/Sub.md", "b" * 32)  # unique id
+        dupes = ns._detect_duplicate_notion_ids()
+        self.assertEqual(list(dupes.keys()), ["c" * 32])
+        self.assertEqual(len(dupes["c" * 32]), 2)
+
+    def test_push_refuses_stale_duplicate(self):
+        tracked = self._write("Parent/Child.md", self.DASHED)
+        stale = self._write("Child.md", self.DASHED)
+        ns.save_sync_state({"items": {"c" * 32: {
+            "title": "Child", "path": "Parent/Child", "type": "page",
+            "synced_at": "2026-07-10T00:00:00", "last_edited_time": ""}}})
+        self.assertEqual(ns._canonical_tracked_filepath(self.DASHED), tracked)
+        ok = _quiet(ns.cmd_push, str(stale))
+        self.assertFalse(ok)
+        # the tracked file itself is not blocked by the guard
+        self.assertEqual(ns._canonical_tracked_filepath("c" * 32), tracked)
 
 
 if __name__ == "__main__":

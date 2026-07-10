@@ -2584,12 +2584,13 @@ def cmd_new(parent_ref, title, children=None):
     """Scaffold a new page structure with front matter and child links."""
     children = children or []
 
+    tree = _load_tree_cache()
     parent_id = ""
+    parent_local_file = None
     if parent_ref.startswith("http"):
         parent_id = extract_page_id_from_url(parent_ref)
     else:
         # Try to find parent in tree_cache by path or title
-        tree = _load_tree_cache()
         for t_item in tree:
             if t_item.get("title") == parent_ref or t_item.get("path") == parent_ref:
                 parent_id = t_item["id"]
@@ -2601,6 +2602,8 @@ def cmd_new(parent_ref, title, children=None):
                 text = p.read_text(encoding="utf-8")
                 fm, _ = parse_front_matter(text)
                 parent_id = fm.get("notion_id", "")
+                if parent_id:
+                    parent_local_file = p
 
     if not parent_id:
         print("ERROR: Could not resolve parent: %s" % parent_ref, flush=True)
@@ -2608,14 +2611,16 @@ def cmd_new(parent_ref, title, children=None):
         return False
 
     safe_title = sanitize_filename(title)
+    scaffold_base = _scaffold_base_dir(parent_id, parent_local_file, tree)
 
     if children:
         # Container page → create directory
-        page_dir = CFG.base_output_dir / safe_title
+        page_dir = scaffold_base / safe_title
         page_dir.mkdir(parents=True, exist_ok=True)
         page_path = page_dir / (safe_title + ".md")
     else:
-        page_path = CFG.base_output_dir / (safe_title + ".md")
+        scaffold_base.mkdir(parents=True, exist_ok=True)
+        page_path = scaffold_base / (safe_title + ".md")
 
     if page_path.exists():
         print("WARNING: File already exists: %s" % page_path, flush=True)
@@ -2635,9 +2640,10 @@ def cmd_new(parent_ref, title, children=None):
         body_lines.append("")
         for child_name in children:
             safe_child = sanitize_filename(child_name)
-            child_dir = CFG.base_output_dir / safe_title / safe_child
-            child_dir.mkdir(parents=True, exist_ok=True)
-            child_path = child_dir / (safe_child + ".md")
+            # Flat form: item_to_filepath resolves childless pages to
+            # page_dir/<child>.md, so scaffold there (container form would
+            # duplicate the file once sync downloads to the canonical path)
+            child_path = page_dir / (safe_child + ".md")
 
             # Create child .md
             child_fm = [
@@ -2666,6 +2672,100 @@ def cmd_new(parent_ref, title, children=None):
     else:
         print("     nsync push %s" % page_path, flush=True)
     return True
+
+
+def _norm_page_id(pid):
+    """Normalize a Notion page id for comparison (dashless, lowercase)."""
+    return (pid or "").replace("-", "").lower()
+
+
+def _scaffold_base_dir(parent_id, parent_local_file, tree):
+    """Directory where children of parent_id canonically live.
+
+    Matches item_to_filepath so that a later sync downloads the new page to
+    the same file that `new` scaffolded (prevents same-notion_id duplicates):
+    children of the root live at the workspace root, children of any other
+    page live in that page's folder.
+    """
+    norm = _norm_page_id(parent_id)
+    for t_item in tree:
+        if _norm_page_id(t_item.get("id")) != norm:
+            continue
+        if t_item.get("is_root"):
+            return CFG.base_output_dir
+        parts = [sanitize_filename(x) for x in t_item["path"].split("/")]
+        return CFG.base_output_dir / os.path.join(*parts)
+    # Parent not crawled yet — fall back to its local file location if given
+    if parent_local_file is not None:
+        p = parent_local_file.resolve()
+        if p.parent.name == p.stem:
+            # container form: dir/Parent/Parent.md → children live in dir/Parent/
+            return p.parent
+        # bare form: base/Parent.md → children live in base/Parent/
+        return p.parent / p.stem
+    print("WARNING: Parent not found in tree cache — scaffolding at workspace root.", flush=True)
+    print("  Run './nsync.sh refresh' first to scaffold under the parent folder.", flush=True)
+    return CFG.base_output_dir
+
+
+def _entry_filepath(entry):
+    """Local filepath a sync_state entry maps to (or None if it has no path)."""
+    item_path = entry.get("path", "")
+    if not item_path:
+        return None
+    parts = item_path.split("/")
+    sanitized = [sanitize_filename(x) for x in parts]
+    fname = sanitized[-1]
+    if not fname.endswith(".md"):
+        fname += ".md"
+    if len(sanitized) > 1:
+        filepath = CFG.base_output_dir / os.path.join(*sanitized[:-1]) / fname
+    else:
+        filepath = CFG.base_output_dir / fname
+    container_path = CFG.base_output_dir / os.path.join(*sanitized) / fname
+    if container_path.exists():
+        filepath = container_path
+    return filepath
+
+
+def _canonical_tracked_filepath(item_id):
+    """Local file tracked by sync_state for item_id, or None if untracked."""
+    state = load_sync_state()
+    items = state.get("items", {})
+    entry = items.get(item_id)
+    if not entry:
+        norm = _norm_page_id(item_id)
+        for k, v in items.items():
+            if _norm_page_id(k) == norm:
+                entry = v
+                break
+    if not entry:
+        return None
+    return _entry_filepath(entry)
+
+
+def _detect_duplicate_notion_ids():
+    """Find notion_ids present in more than one local .md file.
+
+    Duplicates arise when a copy of a tracked file lingers (e.g. scaffolds
+    from old versions of `new`, manual copies): only the tracked file syncs,
+    so editing the other one silently diverges — and pushing it overwrites
+    newer Notion content. Returns {dashless_id: [Path, ...]} for ids seen twice+.
+    """
+    by_id = {}
+    excl = CFG.exclude_paths + ["_assets", "_db_assets"]
+    for md_file in CFG.base_output_dir.rglob("*.md"):
+        if any(e in str(md_file) for e in excl):
+            continue
+        try:
+            text = md_file.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        fm, _ = parse_front_matter(text)
+        nid = fm.get("notion_id", "")
+        if nid:
+            by_id.setdefault(_norm_page_id(nid), []).append(md_file)
+    return {k: v for k, v in by_id.items() if len(v) > 1}
 
 
 def _load_tree_cache():
@@ -2840,7 +2940,7 @@ def cmd_push_new(filepath, dry_run=False, recursive=False):
             # Check if this is a direct child of the parent
             parent_path = ""
             for pt in tree:
-                if pt["id"] == notion_parent:
+                if _norm_page_id(pt["id"]) == _norm_page_id(notion_parent):
                     parent_path = pt.get("path", "")
                     break
             t_path = t_item.get("path", "")
@@ -2900,25 +3000,31 @@ def cmd_push_new(filepath, dry_run=False, recursive=False):
     fm_lines.append("---")
     p.write_text("\n".join(fm_lines) + "\n\n" + body, encoding="utf-8")
 
-    # Update sync_state
+    # Locate parent in tree_cache to derive the new page's tree path
+    parent_item = None
+    for t in tree:
+        if _norm_page_id(t.get("id")) == _norm_page_id(notion_parent):
+            parent_item = t
+            break
+
+    # Crawl paths never include the root page name, so root children get no prefix
+    if parent_item and not parent_item.get("is_root"):
+        parent_path = parent_item["path"]
+    else:
+        parent_path = ""
+    new_tree_path = parent_path + "/" + title if parent_path else title
+
+    # Update sync_state with the same entry shape sync uses, so local-change
+    # detection tracks this file from the start (not only after the next sync)
     state = load_sync_state()
     state.setdefault("items", {})[new_id] = {
-        "filepath": str(p),
+        "title": title, "path": new_tree_path,
+        "type": "page", "last_edited_time": get_page_last_edited(new_id),
         "synced_at": now,
         "pushed_at": now,
         "content_hash": _file_content_hash(p),
     }
     save_sync_state(state)
-
-    # Update tree_cache
-    parent_item = None
-    for t in tree:
-        if t["id"] == notion_parent:
-            parent_item = t
-            break
-
-    parent_path = parent_item["path"] if parent_item else ""
-    new_tree_path = parent_path + "/" + title if parent_path else title
     new_tree_item = {
         "type": "page",
         "title": title,
@@ -3016,7 +3122,7 @@ def _infer_parent_from_path(filepath):
 
     dir_parts = list(rel_dir.parts)
 
-    # Tree paths may include the root page name as prefix (e.g., "Palma/子ページ").
+    # Tree paths may include the root page name as prefix (e.g., "My Project/子ページ").
     # Local paths don't include the root name (base dir IS the root).
     # So we need to compare with and without root prefix.
     root_prefix = sanitize_filename(root_item["title"]) if root_item else ""
@@ -3284,6 +3390,24 @@ def cmd_push(filepath, dry_run=False, recursive=False, use_legacy=False):
         if not fm.get("title"):
             fm["title"] = p.stem
         return cmd_push_new(filepath, dry_run=dry_run, recursive=recursive)
+
+    # Refuse to push a stale duplicate: if sync tracks this notion_id at a
+    # different local path and that file exists, pushing this copy would
+    # overwrite newer Notion content with stale text.
+    canonical = _canonical_tracked_filepath(notion_id)
+    if canonical and canonical.exists():
+        try:
+            is_same_file = canonical.samefile(p)
+        except OSError:
+            is_same_file = True
+        if not is_same_file:
+            print("ERROR: Another local file is tracked for this page (notion_id %s...):" % notion_id[:8], flush=True)
+            print("  tracked:  %s" % canonical, flush=True)
+            print("  this one: %s" % p, flush=True)
+            print("  Pushing this copy could overwrite newer Notion content with stale text.", flush=True)
+            print("  -> Edit and push the tracked file, or delete it first if this copy", flush=True)
+            print("     is the one you want to keep.", flush=True)
+            return False
 
     new_blocks = markdown_to_notion_blocks(body)
     new_blocks = _resolve_local_uploads(new_blocks, p.parent, dry_run)
@@ -3629,21 +3753,7 @@ def _detect_local_changes(state):
         if item_type != "page":
             continue
 
-        filepath = None
-        item_path = entry.get("path", "")
-        if item_path:
-            parts = item_path.split("/")
-            sanitized = [sanitize_filename(p) for p in parts]
-            fname = sanitized[-1]
-            if not fname.endswith(".md"):
-                fname += ".md"
-            if len(sanitized) > 1:
-                filepath = CFG.base_output_dir / os.path.join(*sanitized[:-1]) / fname
-            else:
-                filepath = CFG.base_output_dir / fname
-            container_path = CFG.base_output_dir / os.path.join(*sanitized) / fname
-            if container_path.exists():
-                filepath = container_path
+        filepath = _entry_filepath(entry)
 
         if not filepath or not filepath.exists():
             continue
@@ -3855,6 +3965,26 @@ def cmd_sync(force=False, dry_run=False, refresh=False, no_push=False):
 
     # Phase 1: Detect local changes (fast, local-only)
     local_changes = [] if no_push else _detect_local_changes(state)
+
+    # Phase 1.5: Warn about duplicate notion_ids (stale copies of tracked files)
+    dupes = _detect_duplicate_notion_ids()
+    if dupes:
+        print("WARNING: %d notion_id(s) appear in multiple local files:" % len(dupes), flush=True)
+        for nid, paths in sorted(dupes.items()):
+            tracked_fp = _canonical_tracked_filepath(nid)
+            print("  id %s...:" % nid[:8], flush=True)
+            for fp in sorted(paths):
+                marker = ""
+                if tracked_fp:
+                    try:
+                        if fp.resolve() == tracked_fp.resolve():
+                            marker = "  <- tracked (syncs)"
+                    except OSError:
+                        pass
+                print("    %s%s" % (fp, marker), flush=True)
+        print("  Only the tracked file syncs; the others go stale.", flush=True)
+        print("  Delete the stale copies (or push the one you want to keep).", flush=True)
+        print(flush=True)
 
     new_items = []
     updated_items = []
