@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-07-14
+
+Adds an `install` subcommand that places nsync in the canonical skill directory
+and scaffolds `.env`, removing the manual-placement footguns behind v1.0.0's F1.
+
+`install` サブコマンドを追加。正準スキルディレクトリへの配置と `.env` 雛形生成を
+1コマンド化し、手動配置起因の不具合（v1.0.0 の F1）を解消します。
+
+### Added
+
+- **`install [--target claude|cursor|global] [--dir PATH] [--force]`** — places
+  nsync into the canonical skill directory (`.claude/skills/nsync`, shared by
+  Claude Code and Cursor) and scaffolds a `.env` template in one step. Safety by
+  design:
+  - never overwrites an existing `.env` (token safety)
+  - refuses to overwrite a non-empty target without `--force`
+  - idempotent — running from the canonical path only ensures `.env`, no copy
+  - copies an allowlist only (never carries over `.env`, `_sync/`, `__pycache__`,
+    `*.db`, `.git`)
+  - guards against nested source/target and a file sitting at the target path
+- Regression tests for `install` (`tests/test_install.py`).
+
+### Changed
+
+- `__version__` corrected to track the released version (was left at `0.1.0`
+  through the v1.0.0 release).
+
+### Notes
+
+- This release only adds the `install` command; the push / sync / pull code paths
+  are unchanged from v1.0.0, so the v1.0.0 destructive-behavior guarantees (child
+  protection, mention preservation, link safety) carry over unchanged.
+- F1 (non-standard install locations needing `NSYNC_SCRIPT`) from the v1.0.0 E2E
+  findings is now addressed by `install` canonicalizing placement.
+
+[1.1.0]: https://github.com/miyatti777/nsync/releases/tag/v1.1.0
+
 ## [1.0.0] - 2026-07-10
 
 First stable release — the first version verified end-to-end in a third-party
