@@ -8,7 +8,7 @@ nsync — Generic Notion Sync Tool
 - push: ローカルMD → Notion更新（個別ページ）
 """
 
-__version__ = "0.1.0"
+__version__ = "1.1.0"
 
 import atexit
 import hashlib
@@ -4443,6 +4443,185 @@ python3 "$NSYNC" --config "$DIR/.nsync.yaml" "${@:-sync}"
 
 
 # ==========================================
+# Install (canonical skill placement)
+# ==========================================
+
+# CC and Cursor share the same .claude/skills/ mechanism, so both resolve to the
+# same canonical directory. Codex is not a supported target (no AGENTS.md yet).
+_INSTALL_TARGETS = ("claude", "cursor", "global")
+
+# Files/dirs copied when relocating an install to the canonical path.
+_INSTALL_COPY_ALLOWLIST = (
+    "scripts", "docs", "tests",
+    "SKILL.md", "README.md", "CHANGELOG.md", "LICENSE", "TESTING.md", ".gitignore",
+)
+
+_ENV_TEMPLATE = "NOTION_API_TOKEN=\nNOTION_API_VERSION=2022-06-28\n"
+
+
+def _find_git_root(start):
+    """Walk up from `start` looking for a .git dir/file. Return Path or None."""
+    p = Path(start).resolve()
+    for cand in [p, *p.parents]:
+        if (cand / ".git").exists():
+            return cand
+    return None
+
+
+def _resolve_install_target(target, dir_opt, cwd, home):
+    """Resolve the canonical nsync skill directory for an install target.
+
+    - dir_opt overrides the base dir     -> <dir_opt>/.claude/skills/nsync
+    - global                             -> <home>/.claude/skills/nsync
+    - claude | cursor                    -> <git-root(cwd) or cwd>/.claude/skills/nsync
+    Returns a resolved Path.
+    """
+    if dir_opt:
+        base = Path(dir_opt).expanduser().resolve()
+    elif target == "global":
+        base = Path(home).expanduser().resolve()
+    else:
+        git_root = _find_git_root(cwd)
+        base = git_root if git_root else Path(cwd).resolve()
+    return (base / ".claude" / "skills" / "nsync").resolve()
+
+
+def _scaffold_env(skill_dir):
+    """Create skill_dir/.env from template if missing. Never overwrites.
+
+    Returns (env_path, created:bool).
+    """
+    env_path = Path(skill_dir) / ".env"
+    if env_path.exists():
+        return env_path, False
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    env_path.write_text(_ENV_TEMPLATE, encoding="utf-8")
+    return env_path, True
+
+
+def _copy_ignore(dirpath, names):
+    """shutil.copytree ignore callback: drop build/runtime cruft and secrets."""
+    ignored = []
+    for n in names:
+        if n in ("__pycache__", ".git", ".env", "_sync") or n.endswith(".pyc") or n.endswith(".db"):
+            ignored.append(n)
+    return ignored
+
+
+def install_skill(source_root, target_root, force=False):
+    """Ensure nsync is installed at the canonical target_root.
+
+    Non-destructive & idempotent:
+      - Never overwrites an existing .env (token safety).
+      - Refuses to clobber a differing existing install unless force=True.
+      - Refuses nested source/target (would self-delete/recurse).
+    Returns a result dict {status, target, env_created, env_path, copied, messages}.
+    Pure (no network, no sys.exit) so it can be unit-tested.
+    Statuses: already_canonical | exists | installed | updated | error
+    """
+    import shutil
+    source_root = Path(source_root).resolve()
+    target_root = Path(target_root).resolve()
+
+    # Case 1: already at the canonical location — just ensure .env + report.
+    if source_root == target_root:
+        env_path, created = _scaffold_env(target_root)
+        return {
+            "status": "already_canonical", "target": target_root,
+            "env_created": created, "env_path": env_path, "copied": [],
+            "messages": ["Already installed at canonical path: %s" % target_root],
+        }
+
+    # Guard: nested source/target would recurse or delete the source.
+    if source_root in target_root.parents or target_root in source_root.parents:
+        return {
+            "status": "error", "target": target_root,
+            "env_created": False, "env_path": target_root / ".env", "copied": [],
+            "messages": ["Refusing: source and target are nested (%s vs %s)" % (source_root, target_root)],
+        }
+
+    # Guard: a regular file sitting at the target path would make mkdir() throw.
+    if target_root.exists() and not target_root.is_dir():
+        return {
+            "status": "error", "target": target_root,
+            "env_created": False, "env_path": target_root / ".env", "copied": [],
+            "messages": ["Refusing: target path exists as a file, not a directory: %s" % target_root],
+        }
+
+    # Detect ANY non-empty target directory (not just a well-formed install) so a
+    # partial/foreign directory is never clobbered without --force. Keying only on
+    # scripts/nsync.py would let Case 3's rmtree delete user files that happen to
+    # sit next to a missing entrypoint.
+    target_nonempty = target_root.exists() and target_root.is_dir() and any(target_root.iterdir())
+
+    # Case 2: something is already there — refuse unless force.
+    if target_nonempty and not force:
+        return {
+            "status": "exists", "target": target_root,
+            "env_created": False, "env_path": target_root / ".env", "copied": [],
+            "messages": [
+                "Target directory already exists and is not empty: %s" % target_root,
+                "Re-run with --force to overwrite it, or remove it first.",
+            ],
+        }
+
+    # Case 3: copy canonical files into target (create or force-overwrite).
+    target_root.mkdir(parents=True, exist_ok=True)
+    copied = []
+    for item in _INSTALL_COPY_ALLOWLIST:
+        src = source_root / item
+        if not src.exists():
+            continue
+        dst = target_root / item
+        if src.is_dir():
+            if dst.is_symlink() or dst.is_file():
+                dst.unlink()  # rmtree() raises on a symlink; a stray file blocks copytree
+            elif dst.exists():
+                shutil.rmtree(dst)  # 3.7-safe replacement for copytree(dirs_exist_ok=True)
+            shutil.copytree(src, dst, ignore=_copy_ignore)
+        else:
+            if dst.is_dir() and not dst.is_symlink():
+                shutil.rmtree(dst)
+            shutil.copy2(src, dst)
+        copied.append(item)
+
+    env_path, created = _scaffold_env(target_root)
+    return {
+        "status": "updated" if target_nonempty else "installed", "target": target_root,
+        "env_created": created, "env_path": env_path, "copied": copied,
+        "messages": ["%s nsync at: %s" % ("Updated" if target_nonempty else "Installed", target_root)],
+    }
+
+
+def cmd_install(target="claude", dir_opt=None, force=False):
+    source_root = Path(__file__).resolve().parent.parent
+    target_root = _resolve_install_target(target, dir_opt, os.getcwd(), os.path.expanduser("~"))
+    result = install_skill(source_root, target_root, force=force)
+
+    for m in result["messages"]:
+        print(m, flush=True)
+
+    if result["status"] in ("exists", "error"):
+        sys.exit(1)
+
+    if result["copied"]:
+        print("Copied: %s" % ", ".join(result["copied"]), flush=True)
+    env_path = result["env_path"]
+    if result["env_created"]:
+        print("Created: %s  (fill in your token!)" % env_path, flush=True)
+    else:
+        print("Kept existing: %s" % env_path, flush=True)
+
+    print("\n=== nsync installed ===", flush=True)
+    print("Skill dir: %s" % result["target"], flush=True)
+    print("\nNext steps (these still need a human — token & page connection):", flush=True)
+    print("  1. Create a Notion integration & copy the token: https://www.notion.so/my-integrations", flush=True)
+    print("  2. Put the token in %s" % env_path, flush=True)
+    print("  3. In Notion, open the target page -> ... -> Add connections -> your integration", flush=True)
+    print("  4. python3 %s/scripts/nsync.py init <notion-page-url> <output-dir>" % result["target"], flush=True)
+
+
+# ==========================================
 # Main
 # ==========================================
 
@@ -4475,6 +4654,27 @@ def main():
         notion_url = args[1]
         output_dir = args[2] if len(args) >= 3 else "."
         cmd_init_workspace(notion_url, output_dir)
+        return
+
+    if command == "install":
+        target = "claude"
+        dir_opt = None
+        force = "--force" in args
+        _usage = "Usage: nsync.py install [--target claude|cursor|global] [--dir PATH] [--force]"
+        for i, a in enumerate(args):
+            if a in ("--target", "--dir"):
+                # Reject a missing value or a value that is actually the next flag.
+                if i + 1 >= len(args) or args[i + 1].startswith("-"):
+                    print(_usage, flush=True)
+                    sys.exit(1)
+                if a == "--target":
+                    target = args[i + 1]
+                else:
+                    dir_opt = args[i + 1]
+        if target not in _INSTALL_TARGETS:
+            print(_usage, flush=True)
+            sys.exit(1)
+        cmd_install(target=target, dir_opt=dir_opt, force=force)
         return
 
     if not config_path:
@@ -4563,6 +4763,8 @@ def print_usage():
     print("nsync %s - Notion Sync Tool" % __version__, flush=True)
     print("", flush=True)
     print("Usage:", flush=True)
+    print("  nsync.py install [--target claude|cursor|global] [--dir PATH] [--force]", flush=True)
+    print("                                             Place nsync in the canonical skill dir", flush=True)
     print("  nsync.py init <notion-url> [output-dir]    Setup new workspace", flush=True)
     print("  nsync.py --config <.nsync.yaml> <command>  Run with config", flush=True)
     print("", flush=True)

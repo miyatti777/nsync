@@ -105,6 +105,7 @@ cd <output_dir>
 
 | コマンド | API必要 | 説明 |
 |---------|---------|------|
+| `install [--target claude\|cursor\|global] [--dir PATH] [--force]` | No | 正準パス（`.claude/skills/nsync`）へ配置＋`.env`雛形生成。冪等・既存.env非上書き・`--force`なしで既存を上書き拒否 |
 | `init <url> [dir]` | Yes | 新規ワークスペース作成 |
 | `sync` | Yes | 双方向同期（ローカル変更Push→リモート変更Pull） |
 | `sync --refresh` | Yes | ページ一覧を最新化してから同期 |

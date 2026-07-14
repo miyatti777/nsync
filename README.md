@@ -34,6 +34,27 @@ mkdir -p ~/.claude/skills
 git clone https://github.com/miyatti777/nsync.git ~/.claude/skills/nsync
 ```
 
+> Claude Code / Cursor は配置先が同じ（`.claude/skills/`）です。専用のスクリプトは不要で、SKILL.md が入った上記の配置だけで自然言語から呼び出せます。
+
+### `install` で配置を正準化する
+
+clone 後に `install` を実行すると、**正準パス（`.claude/skills/nsync`）への配置**と **`.env` 雛形の生成**をまとめて行えます。非標準の場所にクローンしてしまったときの「`nsync.sh` が `nsync.py` を見つけられない」落とし穴（後述の発見ロジック参照）を防げます。
+
+```bash
+python3 <cloneした場所>/scripts/nsync.py install            # git ルート配下の .claude/skills/nsync に配置
+python3 <cloneした場所>/scripts/nsync.py install --target global   # $HOME/.claude/skills/nsync に配置
+python3 <cloneした場所>/scripts/nsync.py install --dir /path/to/proj  # 配置先のベースディレクトリを明示
+```
+
+安全設計（人の操作・上書き起因の不具合を防ぐ）:
+
+- 既存の `.env` は**絶対に上書きしません**（トークンを守る）
+- 既にインストール済みの場所は、`--force` なしでは**上書きを拒否**します（`--force` で更新）
+- **冪等** — 正準パスで実行した場合は配置をコピーせず `.env` 雛形の確認のみ
+- コピー対象は許可リスト（`scripts/` `docs/` `SKILL.md` など）のみ。`.env` / `_sync/` / `__pycache__` などは持ち込みません
+
+`install` はローカルへの配置だけを行います。トークン取得と Notion ページへの「コネクトを追加」は Notion 側の手作業として残ります（下記「初期セットアップ」）。
+
 ### スタンドアロンで使う場合
 
 ```bash
@@ -98,6 +119,7 @@ cd projects/my-project
 
 | コマンド | API必要 | 説明 |
 |---------|---------|------|
+| `install [--target claude\|cursor\|global] [--dir PATH] [--force]` | No | 正準パスへ配置＋`.env`雛形生成（冪等・既存.env非上書き） |
 | `init <url> [dir]` | Yes | 新規ワークスペース作成 |
 | `sync` | Yes | 双方向同期（ローカル変更Push→リモート変更Pull） |
 | `sync --refresh` | Yes | ページ一覧を最新化してから同期 |
