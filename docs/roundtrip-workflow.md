@@ -1,18 +1,20 @@
-# Notion × Claude Code 往復ワークフロー
+# Notion × AIコーディング環境 往復ワークフロー
 
-nsync を使って **戦略・企画は Notion で、実装・執筆は Claude Code（ローカル）で** 行い、成果を Notion に還流する循環ワークフローの方法論ガイドです。
+nsync を使って **戦略・企画は Notion で、実装・執筆は ローカルのAIコーディング環境（Claude Code / Cursor / Codex など）で** 行い、成果を Notion に還流する循環ワークフローの方法論ガイドです。
+
+このワークフローは特定のツールに依存しません。ローカルで動く AI エディタ（Claude Code / Cursor / Codex など）であれば、同じ「Notion で企画 → ローカルで実装 → Notion に還流」の往復が成立します。以下では総称して **ローカルのAIコーディング環境** と呼び、コマンド例は Claude Code のものを用います（Cursor / Codex でも同様に、それぞれのチャットから nsync を呼び出せます）。
 
 このガイドは実際の運用実績に基づく部分（✅ **実証済み**）と、チーム規模等に応じた提案（💡 **推奨案**）を区別して書いています。
 
-対象読者: Notion と Claude Code（または Cursor 等のAIコーディング環境）を併用する個人〜小チーム。特定のプロジェクト管理手法は前提にしません（AI-PLC を使っている場合は [Appendix](#8-appendix-ai-plc-フル運用との対応) 参照）。
+対象読者: Notion と ローカルのAIコーディング環境（Claude Code / Cursor / Codex 等）を併用する個人〜小チーム。特定のプロジェクト管理手法は前提にしません（AI-PLC を使っている場合は [Appendix](#8-appendix-ai-plc-フル運用との対応) 参照）。
 
 ---
 
 ## 1. なぜ環境を往復するのか
 
-Notion とローカル（Claude Code）は得意分野が違います。
+Notion とローカルのAIコーディング環境は得意分野が違います。
 
-| | Notion | ローカル + Claude Code |
+| | Notion | ローカル（Claude Code / Cursor / Codex） |
 |---|---|---|
 | 得意 | 共同編集・コメント・DB管理・モバイル閲覧・関係者へのレビュー依頼 | ファイル一括操作・grep/検索・コード実行・長文の集中執筆・大量ページの機械的編集 |
 | 苦手 | 大量ページの一括編集、コードとの往復 | 関係者との共有・レビュー、構造化DBのビュー |
@@ -20,7 +22,7 @@ Notion とローカル（Claude Code）は得意分野が違います。
 どちらか一方に寄せると必ず何かを失います。nsync の双方向同期を使えば、**フェーズごとに得意な環境へ移動する**運用ができます:
 
 - **上流（企画・タスク分解）** → Notion。関係者と議論しながら固める
-- **実行（実装・執筆）** → Claude Code。ローカルファイルとして高速に作業する
+- **実行（実装・執筆）** → ローカルのAIコーディング環境（Claude Code / Cursor / Codex）。ローカルファイルとして高速に作業する
 - **還流（レビュー・戦略見直し）** → Notion。成果を push で戻し、次の一手を考える
 
 ## 2. 循環ワークフロー全体像
@@ -32,7 +34,7 @@ flowchart LR
         B[レビュー・戦略見直し]
     end
     subgraph ローカル側
-        C[Claude Code で実装・執筆]
+        C[AIコーディング環境で実装・執筆<br>Claude Code / Cursor / Codex]
     end
     A -- "確定 → nsync sync / pull" --> C
     C -- "nsync push / sync" --> B
@@ -43,7 +45,7 @@ flowchart LR
 
 1. **Notion で企画する** — ゴール・タスクをページに書く（Notion AI との議論も有効）
 2. **`sync` / `pull` でローカルに取り込む** — 企画ページとタスクが Markdown / SQLite になる
-3. **Claude Code で作業する** — ローカルの Markdown・コードを編集し、成果物を作る
+3. **ローカルのAIコーディング環境で作業する** — Claude Code / Cursor / Codex などでローカルの Markdown・コードを編集し、成果物を作る
 4. **`push` / `sync` で Notion に還流する** — 関係者がレビューし、戦略を見直して 1 に戻る
 
 ## 3. 正本切替ルール（source of truth）
@@ -122,8 +124,9 @@ cd projects/my-project
 # 1. Notion で企画メモを書く → ローカルに取り込む
 ./nsync.sh sync
 
-# 2. Claude Code で作業する（ローカルの .md を編集・成果物を作成）
-#    例: claude "企画メモをもとに提案書のドラフトを作って"
+# 2. ローカルのAIコーディング環境で作業する（Claude Code / Cursor / Codex — .md を編集・成果物を作成）
+#    例（Claude Code CLI）: claude "企画メモをもとに提案書のドラフトを作って"
+#    Cursor / Codex なら各チャットで同様に依頼する
 
 # 3. 成果を Notion に還流する（プレビューしてから push）
 ./nsync.sh push --dry-run 提案書.md
@@ -144,10 +147,10 @@ cd projects/my-project
 | Stage 1: Collection（ゴール設定・Context収集） | Notion（Notion AI） | 完了時に `pull` / `sync` でローカルへ |
 | Stage 2: Inception（タスク分解） | Notion（Notion AI） | backlog 確定後にローカルへ |
 | Stage 3: Construction（実行準備） | どちらでも | — |
-| Stage 4: Operation（タスク実行） | Claude Code | タスク完了・Propagation 時に `push` |
+| Stage 4: Operation（タスク実行） | ローカル（Claude Code / Cursor / Codex） | タスク完了・Propagation 時に `push` |
 | Backtrack（節目再評価・GAP分析） | Notion | `push` で還流 → Notion で再 Collection → `pull` |
 
-✅ **実証済み** — Backtrack で Notion に戻る際は、pull 後に既存 Layer を **scope_reinit**（既存成果物を保持した再初期化）で再開する連携が確立しています。Claude Code 側・Notion 側のルール/スキルを同じ内容に保つ運用（両側同一規定化）の実績もあり、どちらの環境でも同じ判断基準で作業できます。
+✅ **実証済み** — Backtrack で Notion に戻る際は、pull 後に既存 Layer を **scope_reinit**（既存成果物を保持した再初期化）で再開する連携が確立しています。ローカル環境側・Notion 側のルール/スキルを同じ内容に保つ運用（両側同一規定化）の実績もあり、どちらの環境でも同じ判断基準で作業できます。
 
 💡 **推奨案** — AI-PLC の External Sync（backlog を外部 DB に同期する機構）と nsync の DB → SQLite 変換を組み合わせると、Notion DB をタスクボードにしたままローカルから SQL でタスク照会できます。
 

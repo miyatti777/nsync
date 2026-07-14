@@ -14,7 +14,7 @@
 - **New Page Creation**: ローカルでページ構造を作成→Notionに一括反映（scaffold + recursive push）
 - **Claude Skill**: AIアシスタント（Claude / Cursor）から直接呼び出し可能
 
-> 📖 **運用ガイド:** [Notion × Claude Code 往復ワークフロー](docs/roundtrip-workflow.md) — 戦略・企画は Notion、実装・執筆は Claude Code で行き来する循環ワークフローの方法論
+> 📖 **運用ガイド:** [Notion × AIコーディング環境 往復ワークフロー](docs/roundtrip-workflow.md) — 戦略・企画は Notion、実装・執筆は ローカルのAIコーディング環境（Claude Code / Cursor / Codex）で行き来する循環ワークフローの方法論
 >
 > 🔗 **AI-PLC と一緒に:** nsync は、AI駆動のプロダクト開発パイプライン [AI-PLC](https://github.com/miyatti777/ai-plc) で「Notion 上流（企画・タスク分解）⇔ Claude Code 実装」を往復するための同期手段としても使えます。
 
