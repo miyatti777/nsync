@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-07-15
+
+Fixes three Notion↔local sync gaps found in real use — URL parsing, push
+container nesting, front-matter preservation on pull — plus rename-aware
+custom-key carry for `pull -r`.
+
+実運用で見つかった3件の同期の取りこぼし（URLパーサ・push時の親コンテナ生成・
+pull時のfront matter保持）に加え、`pull -r` のrename追随を修正。
+
+### Fixed
+
+- **URL parsing for `app.notion.com/p/` links** — `pull -r` (and any URL-taking
+  command) now extracts the page ID from `app.notion.com/p/<ws>/<slug>-<id>`
+  links including `?t=` query and `#anchor`, not just `www.notion.so`. Raw IDs
+  and uppercase hex are also accepted. (`app.notion.com/p/` 形式・クエリ/アンカー付き
+  URL・生ID・大文字hex に対応)
+- **Push no longer flattens new subfolders** — pushing a file under an
+  intermediate folder with no Notion page (e.g. `Agents/`, `Documents/`) now
+  auto-creates a container page under the nearest existing ancestor and nests
+  the file below it, instead of scattering everything onto the layer top.
+  Existing containers are reused; `push --dry-run` shows `CREATE container: <name>`
+  and no longer persists an inferred `notion_parent` (which would have poisoned
+  a later real push). (中間フォルダのコンテナページを自動生成・既存は再利用・
+  dry-run表示・dry-runはfront matterを汚染しない)
+- **Pull preserves custom front matter** — `pull` / `pull -r` now merge only the
+  nsync-managed keys and keep user-defined keys (e.g. subagent `name` /
+  `description` / `tools` / `delegable`) instead of overwriting the whole header.
+  (pull往復でカスタムfront matterキーを温存)
+- **`pull -r` follows Notion-side renames** — recursive pull now runs rename
+  detection first, moving the old local file (with its custom keys) to the new
+  path before downloading, instead of leaving an orphan and dropping the keys.
+  (pull -r がrename/移動を検出し、カスタムキーごと新パスへ引き継ぎ)
+
+### Added
+
+- `tests/test_sync_gaps.py` — 27 API-free unit tests covering the four fixes
+  (URL extraction, container planning/dry-run, front-matter merge, rename carry).
+
 ## [1.1.0] - 2026-07-14
 
 Adds an `install` subcommand that places nsync in the canonical skill directory
