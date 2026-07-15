@@ -1617,13 +1617,26 @@ def download_item(item, tree=None):
             return False
         filepath.parent.mkdir(parents=True, exist_ok=True)
 
+        # Preserve user-owned front matter (subagent name/description/tools/
+        # delegable, etc.) that lives on the target-path file. When a page was
+        # renamed/re-parented on Notion, cmd_pull_recursive runs _detect_renames
+        # first, so the old file (with its custom keys) has already been moved to
+        # this new path — reading here carries those keys forward instead of
+        # dropping them.
+        custom_fm = _extract_custom_frontmatter(filepath)
+
         md = fetch_page_blocks_as_text(item["id"], page_dir=filepath.parent)
         if tree:
             md = _resolve_child_links(md, item, tree)
         now = datetime.now().isoformat()
-        header = "---\nnotion_id: %s\nnotion_path: %s\nsynced_at: %s\n---\n\n" % (
-            item["id"], item["path"], now
-        )
+        fm_lines = ["---",
+                    "notion_id: %s" % item["id"],
+                    "notion_path: %s" % item["path"],
+                    "synced_at: %s" % now]
+        for k, v in custom_fm.items():
+            fm_lines.append("%s: %s" % (k, v))
+        fm_lines.append("---")
+        header = "\n".join(fm_lines) + "\n\n"
         filepath.write_text(header + md, encoding="utf-8")
         return True
 
@@ -1660,6 +1673,32 @@ def parse_front_matter(text):
                 val = val[1:-1]
             fm[key.strip()] = val
     return fm, parts[2].strip()
+
+
+# Front-matter keys that nsync manages itself and regenerates on every pull.
+# Everything else (subagent name/description/tools/delegable, etc.) is a
+# user-owned custom key that must survive a re-pull or a Notion-side rename.
+_SYNC_FM_KEYS = ("notion_id", "notion_path", "synced_at", "pushed_at")
+
+
+def _extract_custom_frontmatter(filepath):
+    """Return an ordered dict of custom (non-sync) front-matter keys from an
+    existing local .md file, preserving their order.
+
+    Used on pull to carry user-owned front matter (e.g. subagent definition
+    keys) across a re-download of the same page. Combined with rename detection
+    (see _detect_renames), a page moved on Notion carries its custom keys to the
+    new path instead of leaving them behind in an orphaned old file.
+    Returns {} if the file is missing, unreadable, or not Markdown.
+    """
+    if not filepath or not Path(filepath).exists() or Path(filepath).suffix != ".md":
+        return {}
+    try:
+        text = Path(filepath).read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    fm, _ = parse_front_matter(text)
+    return {k: v for k, v in fm.items() if k not in _SYNC_FM_KEYS}
 
 
 _LANG_ALIASES = {
@@ -2503,6 +2542,16 @@ def cmd_pull_recursive(notion_url, dry_run=False):
     _mark_containers(full_tree)
 
     state = load_sync_state()
+
+    # Detect pages renamed/re-parented on Notion and move their local files to
+    # the new path BEFORE downloading. This carries each file's custom front
+    # matter (subagent name/description/tools/delegable, etc.) to the new path —
+    # download_item then preserves those keys — and removes the old orphan file.
+    rename_count = _detect_renames(full_tree, state)
+    if rename_count > 0:
+        print("Renames detected: %d" % rename_count, flush=True)
+        save_sync_state(state)
+
     success = 0
     errors = 0
     print("\nDownloading %d items..." % len(all_items), flush=True)
