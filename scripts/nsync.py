@@ -171,14 +171,31 @@ def sanitize_table_name(name):
 
 
 def extract_page_id_from_url(url):
-    """Notion URL からページ ID を抽出 (ハイフン付き32桁UUID)"""
-    match = re.search(r'([0-9a-f]{32})', url)
-    if match:
-        raw = match.group(1)
+    """Notion URL / ID からページ ID を抽出 (ハイフン付き32桁UUID)。
+
+    対応形式:
+      - https://www.notion.so/<hex32>
+      - https://www.notion.so/<slug>-<hex32>?pvs=4
+      - https://app.notion.com/p/<workspace>/<slug>-<hex32>?t=...#anchor
+      - 生の <hex32> / dashed-UUID (そのまま渡された ID)
+
+    ?query と #anchor を先に除去し、パス内の *最後* の 32hex を採用する
+    (slug 側に紛れる hex や query 内の値が本 ID を覆わないようにするため)。
+    """
+    if not url:
+        return ""
+    # クエリ・フラグメントを除去（?t= や #anchor 内の値を ID 候補から除外）
+    core = url.split("?", 1)[0].split("#", 1)[0]
+    # 大文字で貼られた ID も拾い、Notion API 用に小文字へ正規化する。
+    # パス内の最後の 32hex（末尾の <slug>-<id> 形式の ID を確実に拾う）
+    hex_matches = re.findall(r'[0-9a-fA-F]{32}', core)
+    if hex_matches:
+        raw = hex_matches[-1].lower()
         return "%s-%s-%s-%s-%s" % (raw[:8], raw[8:12], raw[12:16], raw[16:20], raw[20:])
-    match = re.search(r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', url)
+    match = re.search(
+        r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', core)
     if match:
-        return match.group(1)
+        return match.group(0).lower()
     return ""
 
 
@@ -1610,6 +1627,31 @@ def _resolve_child_links(md_text, parent_item, tree):
     return re.sub('\[\[(\U0001f4c4|\U0001f5c3\ufe0f)\s+(.+?)\]\]', _replace, md_text)
 
 
+def _merge_pull_front_matter(existing_fm, notion_id, notion_path, now):
+    """Merge nsync-managed keys into an existing front-matter dict on pull,
+    preserving unknown (user-defined) keys and their order.
+
+    nsync owns notion_id / notion_path / synced_at / pushed_at / notion_parent /
+    title; every other key (e.g. subagent ``name`` / ``description`` / ``tools`` /
+    ``delegable``) is user-defined and preserved so a pull round-trip never drops
+    it. This is the single definition of that pull-side merge policy, shared by
+    ``download_item`` (pull -r) and ``cmd_pull`` (single-file pull).
+
+    notion_id / notion_path / synced_at are refreshed authoritatively.
+    pushed_at and notion_parent are push-side transients and are dropped (a
+    pulled file reflects Notion, not a pending local push). `title` is managed
+    but intentionally not injected here — it is preserved if already present so
+    pulls don't sprout a title key on files that never had one.
+    """
+    merged = dict(existing_fm)  # copy preserves insertion order + custom keys
+    merged["notion_id"] = notion_id
+    merged["notion_path"] = notion_path
+    merged["synced_at"] = now
+    merged.pop("pushed_at", None)
+    merged.pop("notion_parent", None)
+    return merged
+
+
 def download_item(item, tree=None):
     if item["type"] == "page":
         filepath = item_to_filepath(item)
@@ -1621,10 +1663,25 @@ def download_item(item, tree=None):
         if tree:
             md = _resolve_child_links(md, item, tree)
         now = datetime.now().isoformat()
-        header = "---\nnotion_id: %s\nnotion_path: %s\nsynced_at: %s\n---\n\n" % (
-            item["id"], item["path"], now
-        )
-        filepath.write_text(header + md, encoding="utf-8")
+        # Preserve any user-defined front matter already on disk (recursive pull
+        # must not clobber custom keys with a 3-key header).
+        #
+        # Note: preservation is keyed on the local path. If a page was renamed or
+        # re-parented on Notion, item["path"] resolves to a *new* filepath that
+        # doesn't exist yet, so custom keys on the old file are not carried over
+        # (the old file is left orphaned). Use `nsync sync` for rename-aware
+        # updates; `pull -r` is a direct subtree mirror.
+        existing_fm = {}
+        if filepath.exists():
+            try:
+                existing_fm, _ = parse_front_matter(filepath.read_text(encoding="utf-8"))
+            except Exception as e:
+                print("  WARNING: could not read existing front matter of %s (%s); "
+                      "custom keys may be reset." % (filepath, e), flush=True)
+                existing_fm = {}
+        merged = _merge_pull_front_matter(existing_fm, item["id"], item["path"], now)
+        fm_lines = ["---"] + ["%s: %s" % (k, v) for k, v in merged.items()] + ["---"]
+        filepath.write_text("\n".join(fm_lines) + "\n\n" + md, encoding="utf-8")
         return True
 
     elif item["type"] == "db":
@@ -2292,13 +2349,11 @@ def cmd_pull(filepath, dry_run=False, use_legacy=False):
 
     now = datetime.now().isoformat()
 
-    fm["synced_at"] = now
-    if "pushed_at" in fm:
-        del fm["pushed_at"]
-    fm_lines = ["---"]
-    for k, v in fm.items():
-        fm_lines.append("%s: %s" % (k, v))
-    fm_lines.append("---")
+    # Merge managed keys, preserving user-defined front matter (shared with the
+    # recursive-pull path in download_item via _merge_pull_front_matter).
+    merged = _merge_pull_front_matter(
+        fm, fm.get("notion_id", notion_id), fm.get("notion_path", notion_path), now)
+    fm_lines = ["---"] + ["%s: %s" % (k, v) for k, v in merged.items()] + ["---"]
     p.write_text("\n".join(fm_lines) + "\n\n" + md, encoding="utf-8")
 
     lines = md.count("\n") + 1 if md else 0
@@ -2426,7 +2481,9 @@ def _cmd_push_db(db_path, dry_run=False):
 
 def cmd_pull_recursive(notion_url, dry_run=False):
     """Recursively pull a subtree from Notion by URL or page ID."""
-    page_id = extract_page_id_from_url(notion_url) if "notion.so" in notion_url else notion_url
+    # app.notion.com/p/ 形式・?t=クエリ・#anchor 付きでも末尾の 32hex を拾えるよう、
+    # ドメインで分岐せず常に抽出を試みる（生 ID を渡された場合は or で素通し）。
+    page_id = extract_page_id_from_url(notion_url) or notion_url
     if not page_id:
         print("ERROR: Could not extract page ID from: %s" % notion_url, flush=True)
         return False
@@ -2920,14 +2977,21 @@ def _validate_push_structure(filepath, recursive=False):
     return errors, warnings
 
 
-def cmd_push_new(filepath, dry_run=False, recursive=False):
-    """Push a new local page (no notion_id) to Notion, creating it under notion_parent."""
+def cmd_push_new(filepath, dry_run=False, recursive=False,
+                 notion_parent=None, title=None):
+    """Push a new local page (no notion_id) to Notion, creating it under notion_parent.
+
+    ``notion_parent`` / ``title`` may be passed in-memory by the caller. This lets
+    a dry-run preview run without the caller having to persist inferred front
+    matter to disk (persisting it on dry-run would poison a later real push — see
+    cmd_push). When omitted, both are read from the file's front matter.
+    """
     p = Path(filepath)
     text = p.read_text(encoding="utf-8")
     fm, body = parse_front_matter(text)
 
-    title = fm.get("title", p.stem)
-    notion_parent = fm.get("notion_parent", "")
+    title = title or fm.get("title", p.stem)
+    notion_parent = notion_parent or fm.get("notion_parent", "")
 
     if not notion_parent:
         print("ERROR: No notion_parent in front matter. Cannot create page.", flush=True)
@@ -3084,8 +3148,16 @@ def cmd_push_new(filepath, dry_run=False, recursive=False):
 def _infer_parent_from_path(filepath):
     """Infer Notion parent page from local file path using tree_cache.
 
-    Walks up the directory hierarchy to find a directory that corresponds to
-    a known Notion page. Returns (parent_notion_id, title) or None.
+    Walks up the directory hierarchy to find the *deepest* directory that
+    corresponds to a known Notion page. Returns
+    ``(parent_notion_id, title, missing_dirs)`` or ``None``.
+
+    ``missing_dirs`` is the list of intermediate directory names *below* the
+    matched ancestor that have no corresponding Notion page yet (in local
+    top-down order). Callers use it to auto-create container pages so the
+    directory hierarchy is reproduced instead of flattening onto the nearest
+    ancestor (see ``_ensure_parent_container``). It is empty when the file's
+    directory already maps 1:1 onto an existing Notion page.
     """
     p = Path(filepath).resolve()
     base = CFG.base_output_dir.resolve()
@@ -3114,10 +3186,10 @@ def _infer_parent_from_path(filepath):
     except ValueError:
         return None
 
-    # If the file is directly in base dir, parent is root
+    # If the file is directly in base dir, parent is root (no missing containers)
     if str(rel_dir) == ".":
         if root_item:
-            return (root_item["id"], title)
+            return (root_item["id"], title, [])
         return None
 
     dir_parts = list(rel_dir.parts)
@@ -3127,7 +3199,8 @@ def _infer_parent_from_path(filepath):
     # So we need to compare with and without root prefix.
     root_prefix = sanitize_filename(root_item["title"]) if root_item else ""
 
-    # Strategy: match deepest directory first, walk up
+    # Strategy: match deepest directory first, walk up. On a match at depth d,
+    # the directories below it (dir_parts[d:]) have no Notion page yet.
     for depth in range(len(dir_parts), 0, -1):
         candidate_parts = dir_parts[:depth]
 
@@ -3139,19 +3212,110 @@ def _infer_parent_from_path(filepath):
 
             # Direct match (tree paths without root prefix)
             if len(item_sanitized) == depth and item_sanitized == candidate_parts:
-                return (item["id"], title)
+                return (item["id"], title, dir_parts[depth:])
 
             # Match with root prefix stripped (tree path = "Root/A/B", local = "A/B")
             if (len(item_sanitized) == depth + 1
                     and item_sanitized[0] == root_prefix
                     and item_sanitized[1:] == candidate_parts):
-                return (item["id"], title)
+                return (item["id"], title, dir_parts[depth:])
 
-    # Fallback: root page
+    # Fallback: root page. Every directory below base is a missing container.
     if root_item:
-        return (root_item["id"], title)
+        return (root_item["id"], title, dir_parts)
 
     return None
+
+
+def _ensure_parent_container(filepath, dry_run=False):
+    """Resolve the immediate Notion parent for a *new* local file, creating
+    container pages for intermediate folders that have no Notion page yet.
+
+    Without this, a file like ``<Layer>/Agents/AGT_x.md`` whose ``Agents``
+    folder has no Notion page would be flattened onto the nearest existing
+    ancestor (the layer top). Here we create an ``Agents`` container under that
+    ancestor and parent the file below it, reproducing the directory hierarchy.
+
+    Existing same-name container pages are reused (looked up via tree_cache),
+    so pushing sibling files does not create duplicates. Newly created
+    containers are registered into tree_cache immediately for that reuse.
+
+    Returns ``(immediate_parent_id, title, created_names)``. On dry-run no
+    Notion pages are created: container names are printed as
+    ``CREATE container: <name>`` and returned, and the nearest existing
+    ancestor id is returned as the parent (the file itself is not created on
+    dry-run either). Returns ``(None, <stem>, [])`` when no parent can be
+    inferred at all.
+
+    Known limitations (both require running a refresh to reconcile):
+      - A same-name container that exists in Notion but is absent from tree_cache
+        (stale cache) is not detected and would be re-created.
+      - Reuse matches on sanitize_filename(path) parts, so a hand-edited
+        tree_cache whose stored path diverges from the on-disk folder name would
+        miss the match and create a duplicate. nsync-generated folders and tree
+        paths stay consistent, so this only affects manually altered caches.
+    """
+    inferred = _infer_parent_from_path(filepath)
+    if not inferred:
+        return (None, Path(filepath).stem, [])
+
+    parent_id, title, missing_dirs = inferred
+    if not missing_dirs:
+        return (parent_id, title, [])
+
+    tree = _load_tree_cache()
+
+    # Running parent's tree path (crawl paths never include the root name, so
+    # a root parent contributes no prefix — matches cmd_push_new's convention).
+    running_id = parent_id
+    running_path = ""
+    for t in tree:
+        if _norm_page_id(t.get("id")) == _norm_page_id(parent_id):
+            running_path = "" if t.get("is_root") else t.get("path", "")
+            break
+
+    created_names = []
+    for dname in missing_dirs:
+        child_path = (running_path + "/" + dname) if running_path else dname
+
+        # Reuse an existing container page at this exact path (avoid duplicates).
+        existing_id = None
+        want = [sanitize_filename(x) for x in child_path.split("/")]
+        for t in tree:
+            if t.get("type") != "page":
+                continue
+            have = [sanitize_filename(x) for x in t.get("path", "").split("/")]
+            if have == want:
+                existing_id = t["id"]
+                break
+        if existing_id:
+            running_id, running_path = existing_id, child_path
+            continue
+
+        if dry_run:
+            print("  CREATE container: %s" % dname, flush=True)
+            created_names.append(dname)
+            # Cannot create a real id on dry-run; keep the last real ancestor as
+            # the display parent and stop descending (the file is not created).
+            running_path = child_path
+            continue
+
+        print("  Creating container page: %s" % dname, flush=True)
+        new_id = _create_notion_page(running_id, dname, blocks=None)
+        if not new_id:
+            print("  ERROR: failed to create container '%s' — parenting under %s instead"
+                  % (dname, running_id[:8]), flush=True)
+            return (running_id, title, created_names)
+        # Register into tree_cache so sibling files reuse this container.
+        tree.append({
+            "type": "page", "title": dname, "path": child_path, "id": new_id,
+            "depth": len(want), "has_children": True, "is_container": True,
+        })
+        _save_tree_cache_items(tree)
+        created_names.append(dname)
+        running_id, running_path = new_id, child_path
+
+    return (running_id, title, created_names)
 
 
 def _has_nested_child_pages(block):
@@ -3367,20 +3531,36 @@ def cmd_push(filepath, dry_run=False, recursive=False, use_legacy=False):
     notion_id = fm.get("notion_id", "")
 
     if not notion_id:
+        override_parent = None
+        override_title = None
         if not fm.get("notion_parent"):
-            # Try to infer parent from directory structure
-            inferred = _infer_parent_from_path(p)
-            if inferred:
-                parent_id, inferred_title = inferred
-                fm["notion_parent"] = parent_id
+            # Infer parent from directory structure, auto-creating container
+            # pages for intermediate folders that have no Notion page yet
+            # (so e.g. Agents/AGT_x.md is nested under an "Agents" page instead
+            # of being flattened onto the layer top).
+            parent_id, inferred_title, created = _ensure_parent_container(p, dry_run=dry_run)
+            if parent_id:
                 if not fm.get("title"):
                     fm["title"] = inferred_title
-                # Write inferred front matter back so cmd_push_new can read it
-                fm_lines = ["---"]
-                for k, v in fm.items():
-                    fm_lines.append("%s: %s" % (k, v))
-                fm_lines.append("---")
-                p.write_text("\n".join(fm_lines) + "\n\n" + body, encoding="utf-8")
+                if not dry_run:
+                    # Persist inferred parent so cmd_push_new can read it.
+                    fm["notion_parent"] = parent_id
+                    fm_lines = ["---"]
+                    for k, v in fm.items():
+                        fm_lines.append("%s: %s" % (k, v))
+                    fm_lines.append("---")
+                    p.write_text("\n".join(fm_lines) + "\n\n" + body, encoding="utf-8")
+                else:
+                    # Dry-run: DON'T persist the inferred parent. Writing it back
+                    # would leave notion_parent set on disk, so a later real push
+                    # would skip container creation and re-flatten. Pass it in
+                    # memory to cmd_push_new for the preview instead.
+                    override_parent = parent_id
+                    override_title = fm.get("title")
+                if created:
+                    verb = "Would create" if dry_run else "Created"
+                    print("%s %d container page(s): %s" % (
+                        verb, len(created), ", ".join(created)), flush=True)
                 print("Inferred parent: %s (from directory structure)" % parent_id[:8], flush=True)
             elif not fm.get("title"):
                 print("ERROR: Cannot determine where to create page.", flush=True)
@@ -3389,7 +3569,8 @@ def cmd_push(filepath, dry_run=False, recursive=False, use_legacy=False):
                 return False
         if not fm.get("title"):
             fm["title"] = p.stem
-        return cmd_push_new(filepath, dry_run=dry_run, recursive=recursive)
+        return cmd_push_new(filepath, dry_run=dry_run, recursive=recursive,
+                            notion_parent=override_parent, title=override_title)
 
     # Refuse to push a stale duplicate: if sync tracks this notion_id at a
     # different local path and that file exists, pushing this copy would

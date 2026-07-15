@@ -182,6 +182,8 @@ CONFLICT: ページ名 (both local & remote changed, skipping)
 
 ### 既知の注意点
 
+- **URL は `notion.so` / `app.notion.com/p/` 両形式に対応** — `init` / `pull -r` / `new` に渡す Notion URL は `https://www.notion.so/...` でも、`https://app.notion.com/p/<workspace>/<slug>-<id>?t=...#anchor` のように `?t=` クエリや `#anchor` が付いた「Copy link」形式でも、末尾32桁のページIDを自動抽出します。生のページID（32桁hex / ハイフン付きUUID、大文字も可）もそのまま指定できます
+
 - **toggle は「別行形式」で書く** — `<details>` と `<summary>見出し</summary>` をそれぞれ独立した行に書いてください。1行にまとめると正しく復元されません（見出しテキストが失われた空トグルになる、または平文の段落として Push されます）
 
   ```markdown
@@ -342,10 +344,12 @@ cd projects/my-project
 
 - `notion_id` がない → 新規ページとして作成（`notion_parent` に基づく）
 - `notion_parent` もない → **ディレクトリ構造から親ページを自動推定**
+- 推定の途中に Notion ページが無い**中間フォルダ**（例: `Agents/`・`Documents/`）があれば、対応する**コンテナページを最寄りの既存祖先の配下に自動生成**してからその中にファイルを作成します（ディレクトリ階層がそのまま Notion に再現され、レイヤートップへのフラット化を防ぎます）。既存の同名コンテナは再利用され、通常運用では重複作成しません（`tree_cache` が古い、または手動編集で実際の Notion 構造とずれている場合のみ重複しうるため、その際は `refresh` で再同期してください）
 - ファイル名から自動でタイトルを設定（front matter 不要）
 - 作成後、`notion_id` が自動的に front matter に書き込まれる
 - 同名ページが既に Notion にある場合は警告してスキップ
 - `--recursive` で子ページリンク先も再帰的に作成
+- `push --dry-run` では作成予定のコンテナが `Would create N container page(s): ...` / `CREATE container: <名前>` として表示されます
 
 ### Front Matter
 
@@ -365,6 +369,16 @@ title: 企画書
 | `notion_id` | Notion ページ ID（作成後に自動設定） |
 
 UUIDは引用符あり（`"..."` / `'...'`）でも可（値の先頭・末尾が同じ引用符の場合に自動除去）。
+
+### Pull と Front Matter の往復（round-trip）
+
+pull（`pull -r` 含む）は nsync 管理キーだけを扱い、**ユーザーが独自に追加したキーは温存**します。例えばサブエージェント定義の `name` / `description` / `tools` / `delegable` などを front matter に書いていても、pull で消えません（管理キーだけに触れるマージ方式）。管理キーの扱いは以下のとおり:
+
+- `notion_id` / `notion_path` / `synced_at` — Notion の最新値で更新
+- `pushed_at` / `notion_parent` — push 側の一時キーのため pull 時に除去
+- `title` — 既存の値があればそのまま温存（pull で新規に付与したり、Notion 側の改名を front matter の `title` に反映したりはしません）
+- 単純スカラ・`tools: [Read, Grep]` のようなインライン配列は往復で保持されます（front matter は行単位パースのため、複数行 YAML リストやネスト構造は非対応）
+- 注意: Notion 側でページをリネーム/移動した場合、`pull -r` は新しいパスに書き出すため旧ファイルのカスタムキーは引き継がれません。rename を跨ぐ更新は `sync` を使ってください
 
 ### Front Matter なしで Push
 
