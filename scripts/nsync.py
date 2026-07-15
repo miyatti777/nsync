@@ -1666,11 +1666,10 @@ def download_item(item, tree=None):
         # Preserve any user-defined front matter already on disk (recursive pull
         # must not clobber custom keys with a 3-key header).
         #
-        # Note: preservation is keyed on the local path. If a page was renamed or
-        # re-parented on Notion, item["path"] resolves to a *new* filepath that
-        # doesn't exist yet, so custom keys on the old file are not carried over
-        # (the old file is left orphaned). Use `nsync sync` for rename-aware
-        # updates; `pull -r` is a direct subtree mirror.
+        # Preservation is keyed on the local path. A rename/re-parent on Notion is
+        # handled upstream: cmd_pull_recursive runs _detect_renames first, which
+        # moves the old file (with its custom keys) to this new path, so the read
+        # below still finds them.
         existing_fm = {}
         if filepath.exists():
             try:
@@ -2560,6 +2559,17 @@ def cmd_pull_recursive(notion_url, dry_run=False):
     _mark_containers(full_tree)
 
     state = load_sync_state()
+
+    # Detect pages renamed/re-parented on Notion and move their local files to
+    # the new path BEFORE downloading. This carries each file's custom front
+    # matter (subagent name/description/tools/delegable, etc.) to the new path —
+    # download_item then preserves those keys via _merge_pull_front_matter — and
+    # removes the old orphan file.
+    rename_count = _detect_renames(full_tree, state)
+    if rename_count > 0:
+        print("Renames detected: %d" % rename_count, flush=True)
+        save_sync_state(state)
+
     success = 0
     errors = 0
     print("\nDownloading %d items..." % len(all_items), flush=True)

@@ -101,14 +101,17 @@ class _WorkspaceFixture(unittest.TestCase):
         self._old_sync = ns.CFG.sync_dir
         self._old_base = ns.CFG.base_output_dir
         self._old_tree_json = ns.CFG.tree_json
+        self._old_state_json = ns.CFG.sync_state_json
         ns.CFG.sync_dir = sync_dir
         ns.CFG.base_output_dir = self._tmp
         ns.CFG.tree_json = sync_dir / "tree_cache.json"
+        ns.CFG.sync_state_json = sync_dir / "sync_state.json"
 
     def tearDown(self):
         ns.CFG.sync_dir = self._old_sync
         ns.CFG.base_output_dir = self._old_base
         ns.CFG.tree_json = self._old_tree_json
+        ns.CFG.sync_state_json = self._old_state_json
         shutil.rmtree(self._tmp, ignore_errors=True)
 
     def _mkfile(self, rel):
@@ -311,6 +314,57 @@ class TestDownloadItemPreservesFrontMatter(_WorkspaceFixture):
         fp = self._tmp / "Docs" / "T900.md"
         fm, _ = ns.parse_front_matter(fp.read_text())
         self.assertEqual(set(fm), {"notion_id", "notion_path", "synced_at"})
+
+
+class TestPullRecursiveRenameCarry(_WorkspaceFixture):
+    """Bug 3 (rename): pull -r runs _detect_renames first, moving a renamed
+    page's local file (with its custom keys) to the new path; download_item's
+    merge then preserves those keys instead of leaving an orphan behind."""
+
+    def test_rename_carries_custom_frontmatter_to_new_path(self):
+        page_id = "b" * 32
+        old_item = {"type": "page", "title": "OldName", "path": "Root/OldName", "id": page_id}
+        new_item = {"type": "page", "title": "NewName", "path": "Root/NewName", "id": page_id}
+
+        # A previously synced subagent file at the OLD path with custom keys.
+        old_fp = ns.item_to_filepath(old_item)
+        old_fp.parent.mkdir(parents=True, exist_ok=True)
+        old_fp.write_text(
+            "---\nnotion_id: %s\nnotion_path: Root/OldName\nsynced_at: old\n"
+            "name: researcher\ntools: Read\ndelegable: true\n---\nold body" % page_id,
+            encoding="utf-8")
+
+        # Sync state remembers the old path; the fresh tree has the new path.
+        state = {"items": {page_id: {"type": "page", "title": "OldName",
+                                     "path": "Root/OldName", "last_edited_time": "",
+                                     "synced_at": "old"}}}
+        ns.save_sync_state(state)
+
+        # Phase 0: rename detection moves the old file to the new path.
+        with _capture():
+            moved = ns._detect_renames([new_item], state)
+        self.assertEqual(moved, 1)
+        new_fp = ns.item_to_filepath(new_item)
+        self.assertTrue(new_fp.exists())
+        self.assertFalse(old_fp.exists())              # old orphan removed
+
+        # Phase 4: download overwrites body but the merge keeps the carried keys.
+        orig_fetch = ns.fetch_page_blocks_as_text
+        ns.fetch_page_blocks_as_text = lambda _id, page_dir=None: "REMOTE BODY"
+        try:
+            with _capture():
+                ok = ns.download_item(new_item, tree=None)
+        finally:
+            ns.fetch_page_blocks_as_text = orig_fetch
+
+        self.assertTrue(ok)
+        fm, body = ns.parse_front_matter(new_fp.read_text(encoding="utf-8"))
+        self.assertEqual(body, "REMOTE BODY")
+        self.assertEqual(fm["name"], "researcher")     # custom keys survived rename
+        self.assertEqual(fm["tools"], "Read")
+        self.assertEqual(fm["delegable"], "true")
+        self.assertEqual(fm["notion_id"], page_id)
+        self.assertEqual(fm["notion_path"], "Root/NewName")
 
 
 class TestCmdPullMergePreservesFrontMatter(unittest.TestCase):

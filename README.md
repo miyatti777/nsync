@@ -378,7 +378,7 @@ pull（`pull -r` 含む）は nsync 管理キーだけを扱い、**ユーザー
 - `pushed_at` / `notion_parent` — push 側の一時キーのため pull 時に除去
 - `title` — 既存の値があればそのまま温存（pull で新規に付与したり、Notion 側の改名を front matter の `title` に反映したりはしません）
 - 単純スカラ・`tools: [Read, Grep]` のようなインライン配列は往復で保持されます（front matter は行単位パースのため、複数行 YAML リストやネスト構造は非対応）
-- 注意: Notion 側でページをリネーム/移動した場合、`pull -r` は新しいパスに書き出すため旧ファイルのカスタムキーは引き継がれません。rename を跨ぐ更新は `sync` を使ってください
+- Notion 側でページをリネーム/移動した場合も、`pull -r` は事前に rename を検出して旧ファイルを新パスへ移動してからダウンロードするため、カスタムキーは新パスへ引き継がれます（旧ファイルは残しません）
 
 ### Front Matter なしで Push
 
