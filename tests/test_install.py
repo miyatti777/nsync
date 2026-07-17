@@ -4,7 +4,7 @@
 #  or:  python3 -m pytest tests                   (if pytest is installed)
 #
 # Covers the canonical-placement / anti-footgun install mechanism (T011):
-#   - target resolution (claude/cursor/global/--dir, git-root awareness)
+#   - target resolution (claude/cursor/codex/global/--dir, git-root awareness)
 #   - copy into a fresh canonical dir
 #   - idempotency: re-run on the canonical location is a no-op
 #   - refuses to clobber a differing existing install without --force
@@ -54,6 +54,11 @@ class ResolveTargetTests(unittest.TestCase):
             t = ns._resolve_install_target("claude", d, "/ignored", "/home/me")
             self.assertEqual(t, (Path(d).resolve() / ".claude/skills/nsync").resolve())
 
+    def test_codex_dir_override(self):
+        with tempfile.TemporaryDirectory() as d:
+            t = ns._resolve_install_target("codex", d, "/ignored", "/home/me")
+            self.assertEqual(t, (Path(d).resolve() / ".agents/skills/nsync").resolve())
+
     def test_claude_uses_git_root(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d).resolve()
@@ -68,6 +73,15 @@ class ResolveTargetTests(unittest.TestCase):
             cwd = Path(d).resolve()
             t = ns._resolve_install_target("claude", None, str(cwd), "/home/me")
             self.assertEqual(t, (cwd / ".claude/skills/nsync").resolve())
+
+    def test_codex_uses_git_root(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d).resolve()
+            (root / ".git").mkdir()
+            sub = root / "a" / "b"
+            sub.mkdir(parents=True)
+            t = ns._resolve_install_target("codex", None, str(sub), "/home/me")
+            self.assertEqual(t, (root / ".agents/skills/nsync").resolve())
 
 
 class InstallSkillTests(unittest.TestCase):
@@ -94,6 +108,17 @@ class InstallSkillTests(unittest.TestCase):
             self.assertTrue((target / ".env").exists())
             self.assertIn("NOTION_API_TOKEN=", (target / ".env").read_text())
             self.assertTrue(res["env_created"])
+
+    def test_fresh_codex_install_uses_agents_skill_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = _make_source(Path(d) / "src")
+            project = Path(d) / "project"
+            target = ns._resolve_install_target("codex", str(project), "/ignored", "/home/me")
+            res = self._run(src, target)
+            self.assertEqual(res["status"], "installed")
+            self.assertEqual(target, (project / ".agents/skills/nsync").resolve())
+            self.assertTrue((target / "SKILL.md").exists())
+            self.assertTrue((target / "scripts" / "nsync.py").exists())
 
     def test_already_canonical_is_noop_copy(self):
         with tempfile.TemporaryDirectory() as d:

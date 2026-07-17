@@ -12,7 +12,7 @@
 - **Refresh**: Notionのページツリーを最新化してから同期（新規・削除ページの検出）
 - **DB → SQLite**: NotionデータベースをSQLiteファイルに変換し、SQLクエリ可能
 - **New Page Creation**: ローカルでページ構造を作成→Notionに一括反映（scaffold + recursive push）
-- **Claude Skill**: AIアシスタント（Claude / Cursor）から直接呼び出し可能
+- **AI Coding Skill**: AIアシスタント（Claude Code / Cursor / Codex）から直接呼び出し可能
 
 > 📖 **運用ガイド:** [Notion × AIコーディング環境 往復ワークフロー](docs/roundtrip-workflow.md) — 戦略・企画は Notion、実装・執筆は ローカルのAIコーディング環境（Claude Code / Cursor / Codex）で行き来する循環ワークフローの方法論
 >
@@ -20,7 +20,7 @@
 
 ## インストール
 
-### Claude Skill として使う場合（推奨）
+### Claude Code / Cursor Skill として使う場合（推奨）
 
 プロジェクトルートで:
 
@@ -38,12 +38,23 @@ git clone https://github.com/miyatti777/nsync.git ~/.claude/skills/nsync
 
 > Claude Code / Cursor は配置先が同じ（`.claude/skills/`）です。専用のスクリプトは不要で、SKILL.md が入った上記の配置だけで自然言語から呼び出せます。
 
+### Codex Skill として使う場合
+
+任意の場所へcloneした後、プロジェクトルートを指定してインストールします:
+
+```bash
+python3 <cloneした場所>/scripts/nsync.py install --target codex --dir /path/to/project
+```
+
+Codexの正準配置は `<project>/.agents/skills/nsync` です。追加直後にスキルが表示されない場合は、プロジェクトまたはCodexを再読み込みして `$nsync` を指定します。
+
 ### `install` で配置を正準化する
 
-clone 後に `install` を実行すると、**正準パス（`.claude/skills/nsync`）への配置**と **`.env` 雛形の生成**をまとめて行えます。非標準の場所にクローンしてしまったときの「`nsync.sh` が `nsync.py` を見つけられない」落とし穴（後述の発見ロジック参照）を防げます。
+clone 後に `install` を実行すると、**環境別の正準パス**への配置と **`.env` 雛形の生成**をまとめて行えます。Claude Code / Cursor は `.claude/skills/nsync`、Codexは `.agents/skills/nsync` を使用します。非標準の場所にクローンしてしまったときの「`nsync.sh` が `nsync.py` を見つけられない」落とし穴（後述の発見ロジック参照）を防げます。
 
 ```bash
 python3 <cloneした場所>/scripts/nsync.py install            # git ルート配下の .claude/skills/nsync に配置
+python3 <cloneした場所>/scripts/nsync.py install --target codex  # git ルート配下の .agents/skills/nsync に配置
 python3 <cloneした場所>/scripts/nsync.py install --target global   # $HOME/.claude/skills/nsync に配置
 python3 <cloneした場所>/scripts/nsync.py install --dir /path/to/proj  # 配置先のベースディレクトリを明示
 ```
@@ -65,7 +76,7 @@ curl -o nsync.py https://raw.githubusercontent.com/miyatti777/nsync/main/scripts
 chmod +x nsync.py
 ```
 
-> ⚠️ 標準配置（Gitルートや `$HOME` の `.claude/skills/nsync`）以外に置いた場合、`init` が生成する `nsync.sh` から `nsync.py` を自動発見できないことがあります。その場合は `NSYNC_SCRIPT` 環境変数でパスを指定してください（「nsync.sh の発見ロジック」参照）。
+> ⚠️ 標準配置（Gitルートの `.agents/skills/nsync` / `.claude/skills/nsync`、または `$HOME/.claude/skills/nsync`）以外に置いた場合、`init` が生成する `nsync.sh` から `nsync.py` を自動発見できないことがあります。その場合は `NSYNC_SCRIPT` 環境変数でパスを指定してください（「nsync.sh の発見ロジック」参照）。
 
 ## 初期セットアップ
 
@@ -121,7 +132,7 @@ cd projects/my-project
 
 | コマンド | API必要 | 説明 |
 |---------|---------|------|
-| `install [--target claude\|cursor\|global] [--dir PATH] [--force]` | No | 正準パスへ配置＋`.env`雛形生成（冪等・既存.env非上書き） |
+| `install [--target claude\|cursor\|codex\|global] [--dir PATH] [--force]` | No | 環境別の正準パスへ配置＋`.env`雛形生成（冪等・既存.env非上書き） |
 | `init <url> [dir]` | Yes | 新規ワークスペース作成 |
 | `sync` | Yes | 双方向同期（ローカル変更Push→リモート変更Pull） |
 | `sync --refresh` | Yes | ページ一覧を最新化してから同期 |
@@ -256,9 +267,9 @@ exclude_paths:
 
 ## AI アシスタントからの使い方
 
-### Cursor IDE（Claude Skill として）
+### Claude Code / Cursor / Codex（Skill として）
 
-Cursorのチャットで自然言語で依頼できます:
+各AIコーディング環境のチャットで自然言語から依頼できます。Codexでは `$nsync` を明示して起動することもできます:
 
 ```
 「NotionのMy Projectページをローカルに同期して」
@@ -610,8 +621,10 @@ Notion 側でページ名が変更された場合、`sync` 時（および `pull
 `init` で生成される `nsync.sh` は、以下の順序で `nsync.py` を探します:
 
 1. `NSYNC_SCRIPT` 環境変数（明示指定用）
-2. Git ルートの `.claude/skills/nsync/scripts/nsync.py`
-3. `$HOME/.claude/skills/nsync/scripts/nsync.py`
+2. Git ルートの `.agents/skills/nsync/scripts/nsync.py`
+3. Git ルートの `.claude/skills/nsync/scripts/nsync.py`
+4. `$HOME/.agents/skills/nsync/scripts/nsync.py`
+5. `$HOME/.claude/skills/nsync/scripts/nsync.py`
 
 特殊な配置の場合は `NSYNC_SCRIPT` 環境変数で指定してください:
 

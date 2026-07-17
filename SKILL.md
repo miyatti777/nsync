@@ -1,3 +1,8 @@
+---
+name: nsync
+description: NotionページとローカルMarkdownをnsyncで双方向同期する。Notion同期、nsync sync、pull、push、query、init、Notionページ作成で使用する。
+---
+
 # nsync — Notion Sync Skill
 
 任意のNotionページ配下をローカルにミラーリングし、差分同期・Push・SQLiteクエリを行う汎用ツール。
@@ -17,7 +22,7 @@
 
 ## How to Invoke（依頼の仕方）
 
-### Cursor IDE チャットから
+### Claude Code / Cursor / Codex チャットから
 
 自然言語で依頼するだけで、適切なコマンドが実行されます:
 
@@ -33,7 +38,7 @@
 | 「企画書をNotionに反映して（子ページも）」 | `push -r <file>` |
 | 「画像付きのページをNotionに反映して」 | `push <file>` （_assetsを自動UL） |
 
-### Claude Code / CLI から
+### CLI から
 
 ```bash
 # 双方向同期
@@ -49,7 +54,7 @@ python3 <skill_dir>/scripts/nsync.py query backlog "SELECT * FROM data LIMIT 10"
 ## Architecture
 
 ```
-<skill_dir>/              # .claude/skills/nsync/ (プロジェクト or $HOME)
+<skill_dir>/              # .claude/skills/nsync/ または .agents/skills/nsync/
 ├── SKILL.md              # このファイル
 ├── README.md             # 詳細ドキュメント
 ├── .env                  # 共通トークン（.gitignore 対象）
@@ -109,7 +114,7 @@ cd <output_dir>
 
 | コマンド | API必要 | 説明 |
 |---------|---------|------|
-| `install [--target claude\|cursor\|global] [--dir PATH] [--force]` | No | 正準パス（`.claude/skills/nsync`）へ配置＋`.env`雛形生成。冪等・既存.env非上書き・`--force`なしで既存を上書き拒否 |
+| `install [--target claude\|cursor\|codex\|global] [--dir PATH] [--force]` | No | 環境別の正準パスへ配置＋`.env`雛形生成。冪等・既存.env非上書き・`--force`なしで既存を上書き拒否 |
 | `init <url> [dir]` | Yes | 新規ワークスペース作成 |
 | `sync` | Yes | 双方向同期（ローカル変更Push→リモート変更Pull） |
 | `sync --refresh` | Yes | ページ一覧を最新化してから同期 |
