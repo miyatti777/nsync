@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Codex skill support** — `install --target codex` installs nsync into
+  `.agents/skills/nsync`, `SKILL.md` includes Codex-compatible front matter,
+  and generated `nsync.sh` wrappers discover both Codex and Claude/Cursor
+  canonical skill locations.
+
 ## [1.1.1] - 2026-07-15
 
 Fixes three Notion↔local sync gaps found in real use — URL parsing, push

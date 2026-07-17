@@ -4593,10 +4593,14 @@ NSYNC="${NSYNC_SCRIPT:-}"
 if [ -z "$NSYNC" ]; then
   SEARCH="$DIR"
   while [ -n "$SEARCH" ] && [ "$SEARCH" != "/" ]; do
-    if [ -f "$SEARCH/.claude/skills/nsync/scripts/nsync.py" ]; then
-      NSYNC="$SEARCH/.claude/skills/nsync/scripts/nsync.py"
-      break
-    fi
+    for candidate in \
+      "$SEARCH/.agents/skills/nsync/scripts/nsync.py" \
+      "$SEARCH/.claude/skills/nsync/scripts/nsync.py"; do
+      if [ -f "$candidate" ]; then
+        NSYNC="$candidate"
+        break 2
+      fi
+    done
     NEXT="$(dirname "$SEARCH")"
     [ "$NEXT" = "$SEARCH" ] && break
     SEARCH="$NEXT"
@@ -4605,13 +4609,15 @@ fi
 if [ -z "$NSYNC" ]; then
   GIT_ROOT="$(git -C "$DIR" rev-parse --show-toplevel 2>/dev/null)"
   for candidate in \
+    "${GIT_ROOT:-.}/.agents/skills/nsync/scripts/nsync.py" \
     "${GIT_ROOT:-.}/.claude/skills/nsync/scripts/nsync.py" \
+    "$HOME/.agents/skills/nsync/scripts/nsync.py" \
     "$HOME/.claude/skills/nsync/scripts/nsync.py"; do
     [ -f "$candidate" ] && NSYNC="$candidate" && break
   done
 fi
 if [ -z "$NSYNC" ]; then
-  echo "ERROR: nsync.py not found. Set NSYNC_SCRIPT or install to .claude/skills/nsync/"
+  echo "ERROR: nsync.py not found. Set NSYNC_SCRIPT or install to .agents/skills/nsync/ or .claude/skills/nsync/"
   exit 1
 fi
 SKILL_DIR="$(dirname "$(dirname "$NSYNC")")"
@@ -4637,9 +4643,9 @@ python3 "$NSYNC" --config "$DIR/.nsync.yaml" "${@:-sync}"
 # Install (canonical skill placement)
 # ==========================================
 
-# CC and Cursor share the same .claude/skills/ mechanism, so both resolve to the
-# same canonical directory. Codex is not a supported target (no AGENTS.md yet).
-_INSTALL_TARGETS = ("claude", "cursor", "global")
+# Claude Code and Cursor share .claude/skills/. Codex discovers project skills
+# under .agents/skills/.
+_INSTALL_TARGETS = ("claude", "cursor", "codex", "global")
 
 # Files/dirs copied when relocating an install to the canonical path.
 _INSTALL_COPY_ALLOWLIST = (
@@ -4662,9 +4668,10 @@ def _find_git_root(start):
 def _resolve_install_target(target, dir_opt, cwd, home):
     """Resolve the canonical nsync skill directory for an install target.
 
-    - dir_opt overrides the base dir     -> <dir_opt>/.claude/skills/nsync
+    - dir_opt overrides the base dir     -> environment-specific skill path
     - global                             -> <home>/.claude/skills/nsync
     - claude | cursor                    -> <git-root(cwd) or cwd>/.claude/skills/nsync
+    - codex                              -> <git-root(cwd) or cwd>/.agents/skills/nsync
     Returns a resolved Path.
     """
     if dir_opt:
@@ -4674,7 +4681,8 @@ def _resolve_install_target(target, dir_opt, cwd, home):
     else:
         git_root = _find_git_root(cwd)
         base = git_root if git_root else Path(cwd).resolve()
-    return (base / ".claude" / "skills" / "nsync").resolve()
+    skill_root = ".agents" if target == "codex" else ".claude"
+    return (base / skill_root / "skills" / "nsync").resolve()
 
 
 def _scaffold_env(skill_dir):
@@ -4851,7 +4859,7 @@ def main():
         target = "claude"
         dir_opt = None
         force = "--force" in args
-        _usage = "Usage: nsync.py install [--target claude|cursor|global] [--dir PATH] [--force]"
+        _usage = "Usage: nsync.py install [--target claude|cursor|codex|global] [--dir PATH] [--force]"
         for i, a in enumerate(args):
             if a in ("--target", "--dir"):
                 # Reject a missing value or a value that is actually the next flag.
@@ -4954,7 +4962,7 @@ def print_usage():
     print("nsync %s - Notion Sync Tool" % __version__, flush=True)
     print("", flush=True)
     print("Usage:", flush=True)
-    print("  nsync.py install [--target claude|cursor|global] [--dir PATH] [--force]", flush=True)
+    print("  nsync.py install [--target claude|cursor|codex|global] [--dir PATH] [--force]", flush=True)
     print("                                             Place nsync in the canonical skill dir", flush=True)
     print("  nsync.py init <notion-url> [output-dir]    Setup new workspace", flush=True)
     print("  nsync.py --config <.nsync.yaml> <command>  Run with config", flush=True)
